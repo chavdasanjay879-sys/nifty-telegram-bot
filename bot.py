@@ -7,10 +7,16 @@ from datetime import datetime
 
 # ================= SETTINGS =================
 MAX_DAILY_TRADES = 2
-LOT_SIZE = 75
 BOT_TOKEN = "8797667594:AAFDTUbw-wz-PJRXiJdwRbKdSMZ6mE55S7A"
 CHAT_ID = "1944447859"
 CSV_FILE = "trade_log.csv"
+
+# ઈન્ડેક્સ લિસ્ટ અને તેમની વિગતો
+WATCHLIST = {
+    "NIFTY": {"ticker": "^NSEI", "lot_size": 75, "step": 50},
+    "BANKNIFTY": {"ticker": "^NSEBANK", "lot_size": 30, "step": 100},
+    "SENSEX": {"ticker": "^BSESN", "lot_size": 20, "step": 100}
+}
 # ============================================
 
 bot_active = True
@@ -47,20 +53,20 @@ def check_telegram_commands():
 
                 if cmd == "/start":
                     bot_active = True
-                    send_alert("🟢 Bot Scanning Started via Mobile!")
+                    send_alert("🟢 Multi-Index Bot Scanning Started via Mobile!")
                 elif cmd == "/stop":
                     bot_active = False
-                    send_alert("🔴 Bot Scanning Stopped via Mobile!")
+                    send_alert("🔴 Multi-Index Bot Scanning Stopped via Mobile!")
                 elif cmd == "/status":
                     status_text = "🟢 ACTIVE" if bot_active else "🔴 PAUSED"
-                    send_alert(f"📊 Status: {status_text}\nTrades today: {trades_count}/{MAX_DAILY_TRADES}")
+                    send_alert(f"📊 Status: {status_text}\nScanning: NIFTY, BANKNIFTY, SENSEX\nTrades today: {trades_count}/{MAX_DAILY_TRADES}")
     except Exception as e:
         pass
 
-send_alert("🚀 Cloud Bot Connected with Mobile Control!\nSend /status, /start, or /stop from phone.")
-print("🟢 Cloud Bot Online with Telegram Remote Control")
+send_alert("🚀 Multi-Index Scanner Online!\nMonitoring: NIFTY 50, BANK NIFTY & SENSEX.\nSend /status, /start, or /stop.")
+print("🟢 Multi-Index Bot Online with Telegram Remote Control")
 
-while True:
+while trades_count < MAX_DAILY_TRADES:
     check_telegram_commands()
 
     if not bot_active:
@@ -68,45 +74,58 @@ while True:
         continue
 
     now = datetime.now()
-    try:
-        nifty = yf.Ticker("^NSEI")
-        df = nifty.history(period="1d", interval="1m")
 
-        if len(df) >= 15:
-            current_spot = round(float(df['Close'].iloc[-1]), 2)
-            vwap = round((df['Close'] * df['Volume']).sum() / df['Volume'].sum(), 2) if df['Volume'].sum() > 0 else current_spot
-            rsi = round(calculate_rsi(df['Close']), 2)
+    # ત્રણેય ઈન્ડેક્સ વારાફરતી સ્કેન થશે
+    for name, info in WATCHLIST.items():
+        if trades_count >= MAX_DAILY_TRADES:
+            break
 
-            print(f"[{now.strftime('%H:%M:%S')}] Spot: ₹{current_spot} | VWAP: ₹{vwap} | RSI: {rsi}")
+        try:
+            ticker_data = yf.Ticker(info["ticker"])
+            df = ticker_data.history(period="1d", interval="1m")
 
-            if current_spot > vwap and rsi > 60 and trades_count < MAX_DAILY_TRADES:
-                trades_count += 1
-                atm_strike = f"NIFTY {round(current_spot/50)*50} CE"
-                entry_price = 150.0
-                target = entry_price + 40.0
-                sl = entry_price - 20.0
+            if len(df) >= 15:
+                current_spot = round(float(df['Close'].iloc[-1]), 2)
+                vwap = round((df['Close'] * df['Volume']).sum() / df['Volume'].sum(), 2) if df['Volume'].sum() > 0 else current_spot
+                rsi = round(calculate_rsi(df['Close']), 2)
 
-                msg = (
-                    f"🔴 [LIVE CLOUD TRADE #{trades_count}]\n"
-                    f"Time: {now.strftime('%H:%M:%S')}\n"
-                    f"Spot: ₹{current_spot}\n"
-                    f"Setup: Spot > VWAP & RSI ({rsi}) > 60\n"
-                    f"Simulated Buy: {atm_strike} @ ₹{entry_price}\n"
-                    f"SL: ₹{sl} | Target: ₹{target}"
-                )
-                send_alert(msg)
+                # શરત ચકાસણી
+                if current_spot > vwap and rsi > 60:
+                    trades_count += 1
+                    step = info["step"]
+                    strike = round(current_spot / step) * step
+                    atm_strike = f"{name} {strike} CE"
+                    entry_price = 150.0
+                    target = entry_price + 40.0
+                    sl = entry_price - 20.0
+                    lot = info["lot_size"]
 
-                time.sleep(10)
-                pnl = 40.0 * LOT_SIZE
-                send_alert(f"🎯 [TARGET HIT]\nExited: {atm_strike} @ ₹{target}\nPnL: +₹{pnl:,.2f}")
+                    msg = (
+                        f"🚨 [{name} MOMENTUM BREAKOUT DETECTED]\n"
+                        f"Time: {now.strftime('%H:%M:%S')}\n"
+                        f"Spot Price: ₹{current_spot}\n"
+                        f"VWAP: ₹{vwap} | RSI: {rsi}\n"
+                        f"Simulated Trade: BUY {atm_strike}\n"
+                        f"Lot Size: {lot} | Entry: ₹{entry_price}\n"
+                        f"SL: ₹{sl} | Target: ₹{target}"
+                    )
+                    send_alert(msg)
 
-                with open(CSV_FILE, mode='a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), atm_strike, LOT_SIZE, entry_price, target, pnl, "TARGET HIT"])
+                    time.sleep(10)
+                    pnl = 40.0 * lot
+                    send_alert(f"🎯 [{name} TARGET HIT]\nExited: {atm_strike} @ ₹{target}\nPnL: +₹{pnl:,.2f}")
 
-                if trades_count >= MAX_DAILY_TRADES:
-                    send_alert(f"🏁 Daily Limit ({MAX_DAILY_TRADES}/{MAX_DAILY_TRADES}) Reached.")
-    except Exception as e:
-        print(f"Error: {e}")
+                    # File Logging
+                    with open(CSV_FILE, mode='a', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), atm_strike, lot, entry_price, target, pnl, "TARGET HIT"])
+
+                    if trades_count >= MAX_DAILY_TRADES:
+                        send_alert(f"🏁 Daily Trade Limit Reached ({MAX_DAILY_TRADES}/{MAX_DAILY_TRADES}). Bot is done for today.")
+                        break
+
+                    time.sleep(15)  # ટ્રેડ પછી થોડો બ્રેક
+        except Exception as e:
+            print(f"Error scanning {name}: {e}")
 
     time.sleep(10)
