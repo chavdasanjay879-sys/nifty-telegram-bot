@@ -3,7 +3,20 @@ import csv
 import os
 import time
 import requests
+import threading
 from datetime import datetime
+from flask import Flask
+
+# Render પોર્ટ એરર ફિક્સ કરવા માટે નાનું ડમી વેબ સર્વર
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running live 24x7!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 # ================= SETTINGS =================
 MAX_DAILY_TRADES = 2
@@ -11,7 +24,6 @@ BOT_TOKEN = "8797667594:AAFDTUbw-wz-PJRXiJdwRbKdSMZ6mE55S7A"
 CHAT_ID = "1944447859"
 CSV_FILE = "trade_log.csv"
 
-# ઈન્ડેક્સ લિસ્ટ અને તેમની વિગતો
 WATCHLIST = {
     "NIFTY": {"ticker": "^NSEI", "lot_size": 75, "step": 50},
     "BANKNIFTY": {"ticker": "^NSEBANK", "lot_size": 30, "step": 100},
@@ -63,69 +75,74 @@ def check_telegram_commands():
     except Exception as e:
         pass
 
-send_alert("🚀 Multi-Index Scanner Online!\nMonitoring: NIFTY 50, BANK NIFTY & SENSEX.\nSend /status, /start, or /stop.")
-print("🟢 Multi-Index Bot Online with Telegram Remote Control")
+def main_trading_loop():
+    global trades_count
+    send_alert("🚀 Multi-Index Scanner Online!\nMonitoring: NIFTY 50, BANK NIFTY & SENSEX.\nSend /status, /start, or /stop.")
+    print("🟢 Multi-Index Bot Online with Telegram Remote Control")
 
-while trades_count < MAX_DAILY_TRADES:
-    check_telegram_commands()
+    while trades_count < MAX_DAILY_TRADES:
+        check_telegram_commands()
 
-    if not bot_active:
-        time.sleep(5)
-        continue
+        if not bot_active:
+            time.sleep(5)
+            continue
 
-    now = datetime.now()
+        now = datetime.now()
 
-    # ત્રણેય ઈન્ડેક્સ વારાફરતી સ્કેન થશે
-    for name, info in WATCHLIST.items():
-        if trades_count >= MAX_DAILY_TRADES:
-            break
+        for name, info in WATCHLIST.items():
+            if trades_count >= MAX_DAILY_TRADES:
+                break
 
-        try:
-            ticker_data = yf.Ticker(info["ticker"])
-            df = ticker_data.history(period="1d", interval="1m")
+            try:
+                ticker_data = yf.Ticker(info["ticker"])
+                df = ticker_data.history(period="1d", interval="1m")
 
-            if len(df) >= 15:
-                current_spot = round(float(df['Close'].iloc[-1]), 2)
-                vwap = round((df['Close'] * df['Volume']).sum() / df['Volume'].sum(), 2) if df['Volume'].sum() > 0 else current_spot
-                rsi = round(calculate_rsi(df['Close']), 2)
+                if len(df) >= 15:
+                    current_spot = round(float(df['Close'].iloc[-1]), 2)
+                    vwap = round((df['Close'] * df['Volume']).sum() / df['Volume'].sum(), 2) if df['Volume'].sum() > 0 else current_spot
+                    rsi = round(calculate_rsi(df['Close']), 2)
 
-                # શરત ચકાસણી
-                if current_spot > vwap and rsi > 60:
-                    trades_count += 1
-                    step = info["step"]
-                    strike = round(current_spot / step) * step
-                    atm_strike = f"{name} {strike} CE"
-                    entry_price = 150.0
-                    target = entry_price + 40.0
-                    sl = entry_price - 20.0
-                    lot = info["lot_size"]
+                    if current_spot > vwap and rsi > 60:
+                        trades_count += 1
+                        step = info["step"]
+                        strike = round(current_spot / step) * step
+                        atm_strike = f"{name} {strike} CE"
+                        entry_price = 150.0
+                        target = entry_price + 40.0
+                        sl = entry_price - 20.0
+                        lot = info["lot_size"]
 
-                    msg = (
-                        f"🚨 [{name} MOMENTUM BREAKOUT DETECTED]\n"
-                        f"Time: {now.strftime('%H:%M:%S')}\n"
-                        f"Spot Price: ₹{current_spot}\n"
-                        f"VWAP: ₹{vwap} | RSI: {rsi}\n"
-                        f"Simulated Trade: BUY {atm_strike}\n"
-                        f"Lot Size: {lot} | Entry: ₹{entry_price}\n"
-                        f"SL: ₹{sl} | Target: ₹{target}"
-                    )
-                    send_alert(msg)
+                        msg = (
+                            f"🚨 [{name} MOMENTUM BREAKOUT DETECTED]\n"
+                            f"Time: {now.strftime('%H:%M:%S')}\n"
+                            f"Spot Price: ₹{current_spot}\n"
+                            f"VWAP: ₹{vwap} | RSI: {rsi}\n"
+                            f"Simulated Trade: BUY {atm_strike}\n"
+                            f"Lot Size: {lot} | Entry: ₹{entry_price}\n"
+                            f"SL: ₹{sl} | Target: ₹{target}"
+                        )
+                        send_alert(msg)
 
-                    time.sleep(10)
-                    pnl = 40.0 * lot
-                    send_alert(f"🎯 [{name} TARGET HIT]\nExited: {atm_strike} @ ₹{target}\nPnL: +₹{pnl:,.2f}")
+                        time.sleep(10)
+                        pnl = 40.0 * lot
+                        send_alert(f"🎯 [{name} TARGET HIT]\nExited: {atm_strike} @ ₹{target}\nPnL: +₹{pnl:,.2f}")
 
-                    # File Logging
-                    with open(CSV_FILE, mode='a', newline='') as f:
-                        writer = csv.writer(f)
-                        writer.writerow([now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), atm_strike, lot, entry_price, target, pnl, "TARGET HIT"])
+                        with open(CSV_FILE, mode='a', newline='') as f:
+                            writer = csv.writer(f)
+                            writer.writerow([now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), atm_strike, lot, entry_price, target, pnl, "TARGET HIT"])
 
-                    if trades_count >= MAX_DAILY_TRADES:
-                        send_alert(f"🏁 Daily Trade Limit Reached ({MAX_DAILY_TRADES}/{MAX_DAILY_TRADES}). Bot is done for today.")
-                        break
+                        if trades_count >= MAX_DAILY_TRADES:
+                            send_alert(f"🏁 Daily Trade Limit Reached ({MAX_DAILY_TRADES}/{MAX_DAILY_TRADES}). Bot is done for today.")
+                            break
 
-                    time.sleep(15)  # ટ્રેડ પછી થોડો બ્રેક
-        except Exception as e:
-            print(f"Error scanning {name}: {e}")
+                        time.sleep(15)
+            except Exception as e:
+                print(f"Error scanning {name}: {e}")
 
-    time.sleep(10)
+        time.sleep(10)
+
+if __name__ == "__main__":
+    t = threading.Thread(target=main_trading_loop)
+    t.daemon = True
+    t.start()
+    run_web()
