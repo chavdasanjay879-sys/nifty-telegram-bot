@@ -20,7 +20,7 @@ def run_web():
 
 # ================= SETTINGS =================
 MAX_DAILY_TRADES = 2
-BOT_TOKEN = "8797667594:AAFDTUbw-wz-PJRXiJdwRbKdSMZ6mE55S7A"
+BOT_TOKEN = BOT_TOKEN = "8797667594:AAFZRzm0KISq8z5_TLZupMMw0b3qGGREn-g"
 CHAT_ID = "1944447859"
 CSV_FILE = "trade_log.csv"
 
