@@ -6,6 +6,7 @@ from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 
 import requests
+import numpy as np
 import pandas as pd
 from flask import Flask
 
@@ -17,7 +18,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Bot is running live 24x7 with Two-Direction Strategy, Trailing SL & Hedging Engine!"
+    return "Bot is running live 24x7 with ADX Sideways Filter & Two-Direction Hedging Engine!"
 
 @app.route("/health")
 def health():
@@ -55,6 +56,8 @@ RSI_BULLISH = 55
 RSI_BEARISH = 45
 EMA_FAST = 9
 EMA_SLOW = 21
+ADX_PERIOD = 14
+MIN_ADX_TREND = 20.0  # ADX < 20 means Choppy / Sideways market (No Trade Zone)
 
 SIGNAL_COOLDOWN_MINUTES = 15
 SCAN_INTERVAL_SECONDS = 15
@@ -94,8 +97,8 @@ trade_date = None
 last_signal_time = {}
 total_pnl = 0.0
 
-active_positions = {}       # Confirmed live trades
-pending_confirmations = {}  # Setups waiting for High/Low break confirmation
+active_positions = {}
+pending_confirmations = {}
 price_history = {"NIFTY": [], "BANKNIFTY": []}
 
 state_lock = threading.Lock()
@@ -212,7 +215,7 @@ def reset_daily_counter_if_needed():
             send_alert(
                 f"🌅 New Trading Day: {today}\n"
                 f"Daily Limit: {MAX_DAILY_TRADES}\n"
-                f"Engine: Two-Direction + Trailing SL + Hedging Shield 🛡️"
+                f"Engine: Two-Direction + Trailing SL + ADX Sideways Filter 🛡️"
             )
 
 def calculate_rsi(series, window=14):
@@ -228,6 +231,24 @@ def calculate_rsi(series, window=14):
         return 100.0 if avg_gain.iloc[-1] != 0 else 50.0
     rs = avg_gain.iloc[-1] / avg_loss.iloc[-1]
     return float(100 - (100 / (1 + rs)))
+
+def calculate_adx(series, period=14):
+    """Calculates Trend Strength (ADX) to avoid choppy sideways markets."""
+    if len(series) < period * 2:
+        return 25.0  # Default neutral
+    s = pd.Series(series)
+    diff = s.diff()
+    pos_dm = diff.clip(lower=0)
+    neg_dm = (-diff).clip(lower=0)
+    tr = diff.abs()
+
+    atr = tr.ewm(span=period, adjust=False).mean()
+    pos_di = 100 * (pos_dm.ewm(span=period, adjust=False).mean() / (atr + 1e-6))
+    neg_di = 100 * (neg_dm.ewm(span=period, adjust=False).mean() / (atr + 1e-6))
+
+    dx = 100 * (pos_di - neg_di).abs() / (pos_di + neg_di + 1e-6)
+    adx = dx.ewm(span=period, adjust=False).mean().iloc[-1]
+    return float(adx)
 
 def get_atm_strike(spot, step):
     return int(round(spot / step) * step)
@@ -334,7 +355,7 @@ def track_open_positions(rates):
             del active_positions[idx]
 
 # ============================================================
-# TWO-DIRECTION STRATEGY WITH CONFIRMATION & HEDGING
+# TWO-DIRECTION STRATEGY WITH ADX FILTER & CONFIRMATION
 # ============================================================
 
 def process_pending_confirmations(rates):
@@ -346,9 +367,7 @@ def process_pending_confirmations(rates):
             if not spot or trades_count >= MAX_DAILY_TRADES:
                 continue
 
-            # Confirm Bullish (Price breaks above Confirmation Level)
             is_bull_confirmed = (p["direction"] == "BULLISH" and spot > p["confirm_level"])
-            # Confirm Bearish (Price breaks below Confirmation Level)
             is_bear_confirmed = (p["direction"] == "BEARISH" and spot < p["confirm_level"])
 
             if is_bull_confirmed or is_bear_confirmed:
@@ -385,6 +404,7 @@ def process_pending_confirmations(rates):
                     f"Time: {now_ist().strftime('%H:%M:%S')} IST\n"
                     f"Action: **BUY {p['option_name']}**\n"
                     f"Entry Spot: ₹{spot:,.2f}\n"
+                    f"ADX Strength: {p['adx']:.1f} (Trend Confirmed)\n"
                     f"🎯 Target: ₹{target_price:,.2f} (+{target_pts} pts)\n"
                     f"🛑 Initial SL: ₹{sl_price:,.2f} (-{sl_pts} pts)\n"
                     f"🛡️ **Hedging Shield:** Active ({p['hedge_symbol']})\n"
@@ -411,6 +431,12 @@ def analyze_index(index_name, current_spot, info):
         if index_name in active_positions or index_name in pending_confirmations or trades_count >= MAX_DAILY_TRADES:
             return
 
+    # 1. ADX CHOPPY / SIDEWAYS FILTER
+    adx_val = calculate_adx(history, ADX_PERIOD)
+    if adx_val < MIN_ADX_TREND:
+        # Market is choppy/sideways - Skip trades to avoid whipsaws
+        return
+
     s = pd.Series(history)
     ema_fast = round(float(s.ewm(span=EMA_FAST, adjust=False).mean().iloc[-1]), 2)
     ema_slow = round(float(s.ewm(span=EMA_SLOW, adjust=False).mean().iloc[-1]), 2)
@@ -420,7 +446,7 @@ def analyze_index(index_name, current_spot, info):
     recent_high = max(history[-5:])
     recent_low = min(history[-5:])
 
-    # Two-Direction Setups
+    # Directional setups
     bullish_setup = (current_spot > ema_fast > ema_slow and rsi >= RSI_BULLISH)
     bearish_setup = (current_spot < ema_fast < ema_slow and rsi <= RSI_BEARISH)
 
@@ -458,11 +484,12 @@ def analyze_index(index_name, current_spot, info):
             "sl_pts": info["initial_sl_pts"],
             "trail_trigger_pts": info["trail_trigger_pts"],
             "lot_size": info["lot_size"],
-            "hedge_symbol": hedge_symbol
+            "hedge_symbol": hedge_symbol,
+            "adx": adx_val
         }
 
     setup_msg = (
-        f"🔍 **SETUP DETECTED — WAITING FOR CONFIRMATION**\n"
+        f"🔍 **SETUP DETECTED (ADX {adx_val:.1f} TRENDING)**\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Asset: {index_name}\n"
         f"Pattern: {pattern}\n"
@@ -471,7 +498,7 @@ def analyze_index(index_name, current_spot, info):
         f"Trigger Level: {'Break Above' if direction == 'BULLISH' else 'Break Below'} ₹{confirm_level:,.2f}\n"
         f"🛡️ Hedging Shield: {hedge_symbol}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"Bot will execute trade once trigger is broken!"
+        f"Bot will execute trade once trigger level breaks!"
     )
     send_alert(setup_msg)
 
@@ -499,7 +526,7 @@ def check_telegram_commands():
 
             if text == "/start":
                 bot_active = True
-                send_alert("🟢 BOT STARTED\nTwo-Direction Engine Active.")
+                send_alert("🟢 BOT STARTED\nADX Filter + Two-Direction Engine Active.")
             elif text == "/stop":
                 bot_active = False
                 send_alert("🔴 BOT STOPPED\nScanner Paused.")
@@ -527,7 +554,7 @@ def check_telegram_commands():
             elif text == "/test":
                 rates = get_nse_live_prices()
                 n_price = rates.get("NIFTY", "N/A") if rates else "N/A"
-                send_alert(f"⚡ LIVE NSE FEED\nNIFTY 50: ₹{n_price}\nTwo-Direction Strategy Active!")
+                send_alert(f"⚡ LIVE NSE FEED\nNIFTY 50: ₹{n_price}\nADX Sideways Filter Active!")
             elif text == "/help":
                 send_alert("🤖 COMMANDS:\n/status - Open trades & engine status\n/pnl - Net realized profit/loss\n/test - Live NSE tick check\n/start - Resume\n/stop - Pause")
     except Exception:
@@ -543,10 +570,10 @@ def main_trading_loop():
     trade_date = today_string()
     initialize_csv()
     send_alert(
-        "🚀 TWO-DIRECTION HEDGING ENGINE DEPLOYED\n"
-        "• Hammer (Bullish CE) & Hanging Man (Bearish PE)\n"
-        "• Confirmation Trigger Rule Active\n"
-        "• Dynamic Trailing SL & Hedging Shield Enabled"
+        "🛡️ SIDEWAYS FILTER & TWO-DIRECTION ENGINE ACTIVE\n"
+        "• ADX Filter: Choppy / Sideways Markets Blocked (ADX < 20)\n"
+        "• Hammer & Hanging Man Setups Activated\n"
+        "• Trailing SL & Hedging Protection Enabled"
     )
 
     while True:
