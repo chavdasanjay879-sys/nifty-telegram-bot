@@ -17,7 +17,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Bot is running live 24x7 with Real-time NSE Data!"
+    return "Bot is running live 24x7 with Real-time NSE Data & P&L Engine!"
 
 @app.route("/health")
 def health():
@@ -25,7 +25,8 @@ def health():
         "status": "ok",
         "bot_active": bot_active,
         "trades_today": trades_count,
-        "daily_limit": MAX_DAILY_TRADES
+        "daily_limit": MAX_DAILY_TRADES,
+        "total_pnl": total_pnl
     }
 
 def run_web():
@@ -65,12 +66,16 @@ WATCHLIST = {
     "NIFTY": {
         "symbol": "NIFTY 50",
         "lot_size": 75,
-        "step": 50
+        "step": 50,
+        "target_pts": 40,
+        "sl_pts": 20
     },
     "BANKNIFTY": {
         "symbol": "NIFTY BANK",
         "lot_size": 30,
-        "step": 100
+        "step": 100,
+        "target_pts": 80,
+        "sl_pts": 40
     }
 }
 
@@ -83,8 +88,11 @@ last_update_id = 0
 trades_count = 0
 trade_date = None
 last_signal_time = {}
-state_lock = threading.Lock()
+total_pnl = 0.0
+active_positions = {}  # Holds open paper positions: {index_name: {...}}
 price_history = {"NIFTY": [], "BANKNIFTY": []}
+
+state_lock = threading.Lock()
 
 # ============================================================
 # TELEGRAM
@@ -124,7 +132,7 @@ def get_nse_live_prices():
     url = "https://www.nseindia.com/api/allIndices"
     try:
         res = session.get(url, timeout=10)
-        if res.status_code == 401 or res.status_code == 403:
+        if res.status_code in (401, 403):
             init_nse_session()
             res = session.get(url, timeout=10)
         if res.status_code == 200:
@@ -141,7 +149,7 @@ def get_nse_live_prices():
     return None
 
 # ============================================================
-# INDICATORS & HELPERS
+# HELPERS & LOGGING
 # ============================================================
 
 def now_ist():
@@ -156,19 +164,49 @@ def is_market_open():
         return False
     return MARKET_OPEN <= now.time() <= MARKET_CLOSE
 
+def initialize_csv():
+    if not os.path.exists(CSV_FILE):
+        try:
+            with open(CSV_FILE, mode="w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Date", "Entry_Time", "Exit_Time", "Asset", "Option", "Entry_Spot", "Exit_Spot", "Result", "PnL"])
+        except Exception as e:
+            print(f"CSV init error: {e}")
+
+def log_trade_to_csv(pos, exit_spot, result, pnl):
+    try:
+        with open(CSV_FILE, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                pos["date"],
+                pos["entry_time"],
+                now_ist().strftime("%H:%M:%S"),
+                pos["asset"],
+                pos["option_name"],
+                pos["entry_spot"],
+                exit_spot,
+                result,
+                f"{pnl:.2f}"
+            ])
+    except Exception as e:
+        print(f"CSV log error: {e}")
+
 def reset_daily_counter_if_needed():
-    global trades_count, trade_date, last_signal_time, price_history
+    global trades_count, trade_date, last_signal_time, price_history, total_pnl, active_positions
     today = today_string()
     with state_lock:
         if trade_date != today:
             trade_date = today
             trades_count = 0
+            total_pnl = 0.0
             last_signal_time = {}
+            active_positions = {}
             price_history = {"NIFTY": [], "BANKNIFTY": []}
             send_alert(
                 f"🌅 New Trading Day: {today}\n"
                 f"Daily Limit: {MAX_DAILY_TRADES}\n"
-                f"Engine: 100% Free NSE Real-Time Feed"
+                f"P&L Reset to ₹0.00\n"
+                f"Engine: Live NSE Target/SL Tracker"
             )
 
 def calculate_rsi(series, window=14):
@@ -196,6 +234,76 @@ def signal_allowed(index_name):
     return (now - prev).total_seconds() / 60 >= SIGNAL_COOLDOWN_MINUTES
 
 # ============================================================
+# LIVE POSITION & P&L TRACKING ENGINE
+# ============================================================
+
+def track_open_positions(rates):
+    global total_pnl
+    with state_lock:
+        closed_indices = []
+        for index_name, pos in active_positions.items():
+            current_spot = rates.get(index_name)
+            if not current_spot:
+                continue
+
+            hit_target = False
+            hit_sl = False
+
+            if pos["direction"] == "BULLISH":  # CE Option
+                if current_spot >= pos["target_price"]:
+                    hit_target = True
+                elif current_spot <= pos["sl_price"]:
+                    hit_sl = True
+            else:  # PE Option
+                if current_spot <= pos["target_price"]:
+                    hit_target = True
+                elif current_spot >= pos["sl_price"]:
+                    hit_sl = True
+
+            if hit_target:
+                pnl = pos["target_pts"] * pos["lot_size"]
+                total_pnl += pnl
+                msg = (
+                    f"🎉 **TARGET HIT!** 🎯\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"Asset: {index_name}\n"
+                    f"Position: {pos['option_name']}\n"
+                    f"Entry Spot: ₹{pos['entry_spot']:,.2f}\n"
+                    f"Exit Spot: ₹{current_spot:,.2f}\n"
+                    f"Time: {now_ist().strftime('%H:%M:%S')} IST\n"
+                    f"Gain: +{pos['target_pts']} pts\n"
+                    f"💵 **Trade Profit: +₹{pnl:,.2f}**\n"
+                    f"📊 **Day Total P&L: {'+' if total_pnl >= 0 else ''}₹{total_pnl:,.2f}**\n"
+                    f"━━━━━━━━━━━━━━━━━━"
+                )
+                send_alert(msg)
+                log_trade_to_csv(pos, current_spot, "TARGET_HIT", pnl)
+                closed_indices.append(index_name)
+
+            elif hit_sl:
+                pnl = - (pos["sl_pts"] * pos["lot_size"])
+                total_pnl += pnl
+                msg = (
+                    f"🛑 **STOPLOSS HIT!** ⚠️\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"Asset: {index_name}\n"
+                    f"Position: {pos['option_name']}\n"
+                    f"Entry Spot: ₹{pos['entry_spot']:,.2f}\n"
+                    f"Exit Spot: ₹{current_spot:,.2f}\n"
+                    f"Time: {now_ist().strftime('%H:%M:%S')} IST\n"
+                    f"Loss: -{pos['sl_pts']} pts\n"
+                    f"💸 **Trade Loss: -₹{abs(pnl):,.2f}**\n"
+                    f"📊 **Day Total P&L: {'+' if total_pnl >= 0 else ''}₹{total_pnl:,.2f}**\n"
+                    f"━━━━━━━━━━━━━━━━━━"
+                )
+                send_alert(msg)
+                log_trade_to_csv(pos, current_spot, "STOPLOSS_HIT", pnl)
+                closed_indices.append(index_name)
+
+        for idx in closed_indices:
+            del active_positions[idx]
+
+# ============================================================
 # ANALYSIS LOGIC
 # ============================================================
 
@@ -208,6 +316,11 @@ def analyze_index(index_name, current_spot, info):
 
     if len(history) < EMA_SLOW:
         return
+
+    # Check if there is already an open position on this index
+    with state_lock:
+        if index_name in active_positions or trades_count >= MAX_DAILY_TRADES:
+            return
 
     s = pd.Series(history)
     ema_fast = round(float(s.ewm(span=EMA_FAST, adjust=False).mean().iloc[-1]), 2)
@@ -224,6 +337,21 @@ def analyze_index(index_name, current_spot, info):
     if not signal_allowed(index_name):
         return
 
+    direction = "BULLISH" if bullish else "BEARISH"
+    option_type = "CE" if bullish else "PE"
+    strike = get_atm_strike(current_spot, info["step"])
+    opt_title = f"{index_name} {strike} {option_type}"
+
+    target_pts = info["target_pts"]
+    sl_pts = info["sl_pts"]
+
+    if bullish:
+        target_price = round(current_spot + target_pts, 2)
+        sl_price = round(current_spot - sl_pts, 2)
+    else:
+        target_price = round(current_spot - target_pts, 2)
+        sl_price = round(current_spot + sl_pts, 2)
+
     with state_lock:
         if trades_count >= MAX_DAILY_TRADES:
             return
@@ -231,25 +359,33 @@ def analyze_index(index_name, current_spot, info):
         last_signal_time[index_name] = now_ist()
         current_num = trades_count
 
-    direction = "BULLISH 🚀" if bullish else "BEARISH 🔻"
-    option_type = "CE" if bullish else "PE"
-    strike = get_atm_strike(current_spot, info["step"])
-    opt_title = f"{index_name} {strike} {option_type}"
+        active_positions[index_name] = {
+            "asset": index_name,
+            "option_name": opt_title,
+            "direction": direction,
+            "entry_spot": current_spot,
+            "target_price": target_price,
+            "sl_price": sl_price,
+            "target_pts": target_pts,
+            "sl_pts": sl_pts,
+            "lot_size": info["lot_size"],
+            "date": today_string(),
+            "entry_time": now_ist().strftime("%H:%M:%S")
+        }
 
-    target_pts = 40 if index_name == "NIFTY" else 80
-    sl_pts = 20 if index_name == "NIFTY" else 40
-
+    dir_icon = "BULLISH 🚀" if bullish else "BEARISH 🔻"
     msg = (
-        f"🎯 REAL-TIME TRADE ALERT\n"
+        f"🎯 **REAL-TIME TRADE ALERT**\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Asset: {index_name}\n"
         f"Time: {now_ist().strftime('%H:%M:%S')} IST\n"
-        f"Action: BUY {opt_title}\n"
-        f"Live Spot: ₹{current_spot:,.2f}\n"
+        f"Action: **BUY {opt_title}**\n"
+        f"Entry Spot: ₹{current_spot:,.2f}\n"
         f"9 EMA: ₹{ema_fast:,.2f} | 21 EMA: ₹{ema_slow:,.2f}\n"
         f"RSI (14): {rsi}\n\n"
-        f"🎯 Target Est: +{target_pts} pts\n"
-        f"🛑 Stoploss Est: -{sl_pts} pts\n"
+        f"🎯 Target Level: ₹{target_price:,.2f} (+{target_pts} pts)\n"
+        f"🛑 Stoploss Level: ₹{sl_price:,.2f} (-{sl_pts} pts)\n"
+        f"📦 Lot Size: {info['lot_size']}\n"
         f"Trade #{current_num}/{MAX_DAILY_TRADES}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"⚡ Source: Live NSE Feed"
@@ -287,18 +423,28 @@ def check_telegram_commands():
             elif text == "/status":
                 status = "🟢 ACTIVE" if bot_active else "🔴 PAUSED"
                 mkt = "🟢 OPEN" if is_market_open() else "🔴 CLOSED"
+                open_str = "\n".join([f"• {k}: {v['option_name']} @ ₹{v['entry_spot']}" for k, v in active_positions.items()]) or "None"
                 send_alert(
-                    f"📊 BOT STATUS\n━━━━━━━━━━━━━━\n"
+                    f"📊 **BOT STATUS**\n━━━━━━━━━━━━━━\n"
                     f"Bot: {status}\nMarket: {mkt}\nDate: {today_string()}\n"
                     f"Signals: {trades_count}/{MAX_DAILY_TRADES}\n"
-                    f"Feed: Live NSE Real-Time Feed"
+                    f"Open Positions:\n{open_str}\n"
+                    f"Total P&L: {'+' if total_pnl >= 0 else ''}₹{total_pnl:,.2f}"
+                )
+            elif text == "/pnl":
+                send_alert(
+                    f"💰 **TODAY'S P&L SUMMARY**\n━━━━━━━━━━━━━━\n"
+                    f"Date: {today_string()}\n"
+                    f"Completed Trades: {trades_count}/{MAX_DAILY_TRADES}\n"
+                    f"Realized P&L: {'+' if total_pnl >= 0 else ''}₹{total_pnl:,.2f}\n"
+                    f"Active Trades: {len(active_positions)}"
                 )
             elif text == "/test":
                 rates = get_nse_live_prices()
                 n_price = rates.get("NIFTY", "N/A") if rates else "N/A"
-                send_alert(f"⚡ LIVE NSE TEST\nNIFTY 50: ₹{n_price}\nEngine is live & ready!")
+                send_alert(f"⚡ LIVE NSE TEST\nNIFTY 50: ₹{n_price}\nTracker engine is active!")
             elif text == "/help":
-                send_alert("🤖 COMMANDS:\n/status - Check status\n/test - Test live price\n/start - Resume\n/stop - Pause")
+                send_alert("🤖 COMMANDS:\n/status - Bot status\n/pnl - Live profit/loss\n/test - Live NSE price\n/start - Resume\n/stop - Pause")
     except Exception:
         pass
 
@@ -310,20 +456,26 @@ def telegram_loop():
 def main_trading_loop():
     global trade_date
     trade_date = today_string()
-    send_alert("🚀 LIVE NSE SCANNER ACTIVATED\nFetching real-time ticks directly from NSE.")
+    initialize_csv()
+    send_alert("🚀 LIVE NSE TRACKER ONLINE\nTarget & Stoploss Engine Active with Real-Time P&L.")
 
     while True:
         try:
             reset_daily_counter_if_needed()
-            if not bot_active or not is_market_open() or trades_count >= MAX_DAILY_TRADES:
+            if not bot_active or not is_market_open():
                 time.sleep(30)
                 continue
 
             rates = get_nse_live_prices()
             if rates:
-                for name, info in WATCHLIST.items():
-                    if name in rates:
-                        analyze_index(name, rates[name], info)
+                # 1. Track Target & Stoploss for existing positions
+                track_open_positions(rates)
+
+                # 2. Analyze new signals if limit not reached
+                if trades_count < MAX_DAILY_TRADES:
+                    for name, info in WATCHLIST.items():
+                        if name in rates:
+                            analyze_index(name, rates[name], info)
 
             time.sleep(SCAN_INTERVAL_SECONDS)
         except Exception as e:
