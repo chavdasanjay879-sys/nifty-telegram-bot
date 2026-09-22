@@ -10,14 +10,14 @@ import pandas as pd
 from flask import Flask
 
 # ============================================================
-# RENDER + FLASK
+# RENDER + FLASK WEB SERVER
 # ============================================================
 
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Bot is running live 24x7 with Real-time NSE Data & P&L Engine!"
+    return "Bot is running live 24x7 with Two-Direction Strategy, Trailing SL & Hedging Engine!"
 
 @app.route("/health")
 def health():
@@ -39,7 +39,7 @@ def run_web():
     )
 
 # ============================================================
-# SETTINGS
+# CONFIGURATION & PARAMETERS
 # ============================================================
 
 TIMEZONE = ZoneInfo("Asia/Kolkata")
@@ -67,15 +67,19 @@ WATCHLIST = {
         "symbol": "NIFTY 50",
         "lot_size": 75,
         "step": 50,
-        "target_pts": 40,
-        "sl_pts": 20
+        "target_pts": 45,
+        "initial_sl_pts": 18,
+        "trail_trigger_pts": 20,
+        "hedge_offset": 300
     },
     "BANKNIFTY": {
         "symbol": "NIFTY BANK",
         "lot_size": 30,
         "step": 100,
-        "target_pts": 80,
-        "sl_pts": 40
+        "target_pts": 90,
+        "initial_sl_pts": 35,
+        "trail_trigger_pts": 40,
+        "hedge_offset": 600
     }
 }
 
@@ -89,13 +93,15 @@ trades_count = 0
 trade_date = None
 last_signal_time = {}
 total_pnl = 0.0
-active_positions = {}  # Holds open paper positions: {index_name: {...}}
+
+active_positions = {}       # Confirmed live trades
+pending_confirmations = {}  # Setups waiting for High/Low break confirmation
 price_history = {"NIFTY": [], "BANKNIFTY": []}
 
 state_lock = threading.Lock()
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM NOTIFICATIONS
 # ============================================================
 
 def send_alert(message):
@@ -149,7 +155,7 @@ def get_nse_live_prices():
     return None
 
 # ============================================================
-# HELPERS & LOGGING
+# HELPERS & TECHNICAL FORMULAS
 # ============================================================
 
 def now_ist():
@@ -192,7 +198,7 @@ def log_trade_to_csv(pos, exit_spot, result, pnl):
         print(f"CSV log error: {e}")
 
 def reset_daily_counter_if_needed():
-    global trades_count, trade_date, last_signal_time, price_history, total_pnl, active_positions
+    global trades_count, trade_date, last_signal_time, price_history, total_pnl, active_positions, pending_confirmations
     today = today_string()
     with state_lock:
         if trade_date != today:
@@ -201,12 +207,12 @@ def reset_daily_counter_if_needed():
             total_pnl = 0.0
             last_signal_time = {}
             active_positions = {}
+            pending_confirmations = {}
             price_history = {"NIFTY": [], "BANKNIFTY": []}
             send_alert(
                 f"🌅 New Trading Day: {today}\n"
                 f"Daily Limit: {MAX_DAILY_TRADES}\n"
-                f"P&L Reset to ₹0.00\n"
-                f"Engine: Live NSE Target/SL Tracker"
+                f"Engine: Two-Direction + Trailing SL + Hedging Shield 🛡️"
             )
 
 def calculate_rsi(series, window=14):
@@ -234,7 +240,7 @@ def signal_allowed(index_name):
     return (now - prev).total_seconds() / 60 >= SIGNAL_COOLDOWN_MINUTES
 
 # ============================================================
-# LIVE POSITION & P&L TRACKING ENGINE
+# LIVE POSITION & TRAILING SL ENGINE
 # ============================================================
 
 def track_open_positions(rates):
@@ -249,12 +255,33 @@ def track_open_positions(rates):
             hit_target = False
             hit_sl = False
 
-            if pos["direction"] == "BULLISH":  # CE Option
+            if pos["direction"] == "BULLISH":  # CE
+                gain_pts = current_spot - pos["entry_spot"]
+
+                # Trailing SL Trigger: Shift SL to Entry Spot or higher
+                if gain_pts >= pos["trail_trigger_pts"]:
+                    new_sl = round(pos["entry_spot"] + (gain_pts - pos["trail_trigger_pts"]) * 0.5, 2)
+                    if new_sl > pos["sl_price"]:
+                        pos["sl_price"] = new_sl
+                        pos["is_trailed"] = True
+                        send_alert(f"🛡️ TRAILING SL SHIFTED\nAsset: {index_name} CE\nNew Trailing SL: ₹{pos['sl_price']:,.2f} (Profits Protected!)")
+
                 if current_spot >= pos["target_price"]:
                     hit_target = True
                 elif current_spot <= pos["sl_price"]:
                     hit_sl = True
-            else:  # PE Option
+
+            else:  # PE
+                gain_pts = pos["entry_spot"] - current_spot
+
+                # Trailing SL Trigger for PE
+                if gain_pts >= pos["trail_trigger_pts"]:
+                    new_sl = round(pos["entry_spot"] - (gain_pts - pos["trail_trigger_pts"]) * 0.5, 2)
+                    if new_sl < pos["sl_price"]:
+                        pos["sl_price"] = new_sl
+                        pos["is_trailed"] = True
+                        send_alert(f"🛡️ TRAILING SL SHIFTED\nAsset: {index_name} PE\nNew Trailing SL: ₹{pos['sl_price']:,.2f} (Profits Protected!)")
+
                 if current_spot <= pos["target_price"]:
                     hit_target = True
                 elif current_spot >= pos["sl_price"]:
@@ -264,10 +291,10 @@ def track_open_positions(rates):
                 pnl = pos["target_pts"] * pos["lot_size"]
                 total_pnl += pnl
                 msg = (
-                    f"🎉 **TARGET HIT!** 🎯\n"
+                    f"🎯 **TARGET HIT!** 🚀\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
                     f"Asset: {index_name}\n"
-                    f"Position: {pos['option_name']}\n"
+                    f"Trade: {pos['option_name']}\n"
                     f"Entry Spot: ₹{pos['entry_spot']:,.2f}\n"
                     f"Exit Spot: ₹{current_spot:,.2f}\n"
                     f"Time: {now_ist().strftime('%H:%M:%S')} IST\n"
@@ -281,45 +308,107 @@ def track_open_positions(rates):
                 closed_indices.append(index_name)
 
             elif hit_sl:
-                pnl = - (pos["sl_pts"] * pos["lot_size"])
+                exit_diff = (current_spot - pos["entry_spot"]) if pos["direction"] == "BULLISH" else (pos["entry_spot"] - current_spot)
+                pnl = exit_diff * pos["lot_size"]
                 total_pnl += pnl
+                res_type = "TRAILED_EXIT" if pos.get("is_trailed") and pnl >= 0 else "STOPLOSS_HIT"
+
                 msg = (
-                    f"🛑 **STOPLOSS HIT!** ⚠️\n"
+                    f"{'🛡️ PROTECTED TRAILED EXIT' if res_type == 'TRAILED_EXIT' else '🛑 STOPLOSS HIT! ⚠️'}\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
                     f"Asset: {index_name}\n"
-                    f"Position: {pos['option_name']}\n"
+                    f"Trade: {pos['option_name']}\n"
                     f"Entry Spot: ₹{pos['entry_spot']:,.2f}\n"
                     f"Exit Spot: ₹{current_spot:,.2f}\n"
                     f"Time: {now_ist().strftime('%H:%M:%S')} IST\n"
-                    f"Loss: -{pos['sl_pts']} pts\n"
-                    f"💸 **Trade Loss: -₹{abs(pnl):,.2f}**\n"
+                    f"Diff: {exit_diff:+.2f} pts\n"
+                    f"{'💵 Trade Gain: +' if pnl >= 0 else '💸 Trade Loss: -'}₹{abs(pnl):,.2f}\n"
                     f"📊 **Day Total P&L: {'+' if total_pnl >= 0 else ''}₹{total_pnl:,.2f}**\n"
                     f"━━━━━━━━━━━━━━━━━━"
                 )
                 send_alert(msg)
-                log_trade_to_csv(pos, current_spot, "STOPLOSS_HIT", pnl)
+                log_trade_to_csv(pos, current_spot, res_type, pnl)
                 closed_indices.append(index_name)
 
         for idx in closed_indices:
             del active_positions[idx]
 
 # ============================================================
-# ANALYSIS LOGIC
+# TWO-DIRECTION STRATEGY WITH CONFIRMATION & HEDGING
 # ============================================================
 
-def analyze_index(index_name, current_spot, info):
+def process_pending_confirmations(rates):
     global trades_count
+    with state_lock:
+        confirmed = []
+        for index_name, p in pending_confirmations.items():
+            spot = rates.get(index_name)
+            if not spot or trades_count >= MAX_DAILY_TRADES:
+                continue
+
+            # Confirm Bullish (Price breaks above Confirmation Level)
+            is_bull_confirmed = (p["direction"] == "BULLISH" and spot > p["confirm_level"])
+            # Confirm Bearish (Price breaks below Confirmation Level)
+            is_bear_confirmed = (p["direction"] == "BEARISH" and spot < p["confirm_level"])
+
+            if is_bull_confirmed or is_bear_confirmed:
+                trades_count += 1
+                last_signal_time[index_name] = now_ist()
+                current_num = trades_count
+
+                target_pts = p["target_pts"]
+                sl_pts = p["sl_pts"]
+                target_price = round(spot + target_pts if p["direction"] == "BULLISH" else spot - target_pts, 2)
+                sl_price = round(spot - sl_pts if p["direction"] == "BULLISH" else spot + sl_pts, 2)
+
+                active_positions[index_name] = {
+                    "asset": index_name,
+                    "option_name": p["option_name"],
+                    "direction": p["direction"],
+                    "entry_spot": spot,
+                    "target_price": target_price,
+                    "sl_price": sl_price,
+                    "target_pts": target_pts,
+                    "sl_pts": sl_pts,
+                    "trail_trigger_pts": p["trail_trigger_pts"],
+                    "lot_size": p["lot_size"],
+                    "date": today_string(),
+                    "entry_time": now_ist().strftime("%H:%M:%S"),
+                    "is_trailed": False
+                }
+
+                alert = (
+                    f"⚡ **ORDER EXECUTED (CONFIRMED)**\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"Pattern: {p['pattern']} Activated!\n"
+                    f"Asset: {index_name}\n"
+                    f"Time: {now_ist().strftime('%H:%M:%S')} IST\n"
+                    f"Action: **BUY {p['option_name']}**\n"
+                    f"Entry Spot: ₹{spot:,.2f}\n"
+                    f"🎯 Target: ₹{target_price:,.2f} (+{target_pts} pts)\n"
+                    f"🛑 Initial SL: ₹{sl_price:,.2f} (-{sl_pts} pts)\n"
+                    f"🛡️ **Hedging Shield:** Active ({p['hedge_symbol']})\n"
+                    f"Trade #{current_num}/{MAX_DAILY_TRADES}\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📌 Trailing SL activates at +{p['trail_trigger_pts']} pts"
+                )
+                send_alert(alert)
+                confirmed.append(index_name)
+
+        for idx in confirmed:
+            del pending_confirmations[idx]
+
+def analyze_index(index_name, current_spot, info):
     history = price_history[index_name]
     history.append(current_spot)
     if len(history) > 100:
         history.pop(0)
 
-    if len(history) < EMA_SLOW:
+    if len(history) < EMA_SLOW + 2:
         return
 
-    # Check if there is already an open position on this index
     with state_lock:
-        if index_name in active_positions or trades_count >= MAX_DAILY_TRADES:
+        if index_name in active_positions or index_name in pending_confirmations or trades_count >= MAX_DAILY_TRADES:
             return
 
     s = pd.Series(history)
@@ -328,72 +417,66 @@ def analyze_index(index_name, current_spot, info):
     rsi_val = calculate_rsi(history, RSI_PERIOD)
     rsi = round(rsi_val, 2) if rsi_val is not None else 50.0
 
-    bullish = (current_spot > ema_fast > ema_slow and rsi >= RSI_BULLISH)
-    bearish = (current_spot < ema_fast < ema_slow and rsi <= RSI_BEARISH)
+    recent_high = max(history[-5:])
+    recent_low = min(history[-5:])
 
-    if not bullish and not bearish:
+    # Two-Direction Setups
+    bullish_setup = (current_spot > ema_fast > ema_slow and rsi >= RSI_BULLISH)
+    bearish_setup = (current_spot < ema_fast < ema_slow and rsi <= RSI_BEARISH)
+
+    if not bullish_setup and not bearish_setup:
         return
 
     if not signal_allowed(index_name):
         return
 
-    direction = "BULLISH" if bullish else "BEARISH"
-    option_type = "CE" if bullish else "PE"
-    strike = get_atm_strike(current_spot, info["step"])
-    opt_title = f"{index_name} {strike} {option_type}"
+    step = info["step"]
+    atm_strike = get_atm_strike(current_spot, step)
 
-    target_pts = info["target_pts"]
-    sl_pts = info["sl_pts"]
-
-    if bullish:
-        target_price = round(current_spot + target_pts, 2)
-        sl_price = round(current_spot - sl_pts, 2)
+    if bullish_setup:
+        direction = "BULLISH"
+        pattern = "📈 Bullish Momentum / Hammer"
+        opt_name = f"{index_name} {atm_strike} CE"
+        confirm_level = round(recent_high + 2.0, 2)
+        hedge_strike = atm_strike + info["hedge_offset"]
+        hedge_symbol = f"{index_name} {hedge_strike} PE (Shield)"
     else:
-        target_price = round(current_spot - target_pts, 2)
-        sl_price = round(current_spot + sl_pts, 2)
+        direction = "BEARISH"
+        pattern = "📉 Bearish Hanging Man / Breakdown"
+        opt_name = f"{index_name} {atm_strike} PE"
+        confirm_level = round(recent_low - 2.0, 2)
+        hedge_strike = atm_strike - info["hedge_offset"]
+        hedge_symbol = f"{index_name} {hedge_strike} CE (Shield)"
 
     with state_lock:
-        if trades_count >= MAX_DAILY_TRADES:
-            return
-        trades_count += 1
-        last_signal_time[index_name] = now_ist()
-        current_num = trades_count
-
-        active_positions[index_name] = {
-            "asset": index_name,
-            "option_name": opt_title,
+        pending_confirmations[index_name] = {
             "direction": direction,
-            "entry_spot": current_spot,
-            "target_price": target_price,
-            "sl_price": sl_price,
-            "target_pts": target_pts,
-            "sl_pts": sl_pts,
+            "pattern": pattern,
+            "option_name": opt_name,
+            "confirm_level": confirm_level,
+            "target_pts": info["target_pts"],
+            "sl_pts": info["initial_sl_pts"],
+            "trail_trigger_pts": info["trail_trigger_pts"],
             "lot_size": info["lot_size"],
-            "date": today_string(),
-            "entry_time": now_ist().strftime("%H:%M:%S")
+            "hedge_symbol": hedge_symbol
         }
 
-    dir_icon = "BULLISH 🚀" if bullish else "BEARISH 🔻"
-    msg = (
-        f"🎯 **REAL-TIME TRADE ALERT**\n"
+    setup_msg = (
+        f"🔍 **SETUP DETECTED — WAITING FOR CONFIRMATION**\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"Asset: {index_name}\n"
-        f"Time: {now_ist().strftime('%H:%M:%S')} IST\n"
-        f"Action: **BUY {opt_title}**\n"
-        f"Entry Spot: ₹{current_spot:,.2f}\n"
-        f"9 EMA: ₹{ema_fast:,.2f} | 21 EMA: ₹{ema_slow:,.2f}\n"
-        f"RSI (14): {rsi}\n\n"
-        f"🎯 Target Level: ₹{target_price:,.2f} (+{target_pts} pts)\n"
-        f"🛑 Stoploss Level: ₹{sl_price:,.2f} (-{sl_pts} pts)\n"
-        f"📦 Lot Size: {info['lot_size']}\n"
-        f"Trade #{current_num}/{MAX_DAILY_TRADES}\n"
+        f"Pattern: {pattern}\n"
+        f"Target Strike: {opt_name}\n"
+        f"Current Spot: ₹{current_spot:,.2f}\n"
+        f"Trigger Level: {'Break Above' if direction == 'BULLISH' else 'Break Below'} ₹{confirm_level:,.2f}\n"
+        f"🛡️ Hedging Shield: {hedge_symbol}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ Source: Live NSE Feed"
+        f"Bot will execute trade once trigger is broken!"
     )
-    send_alert(msg)
+    send_alert(setup_msg)
 
 # ============================================================
-# TELEGRAM WORKER THREAD
+# TELEGRAM COMMANDS THREAD
 # ============================================================
 
 def check_telegram_commands():
@@ -416,35 +499,37 @@ def check_telegram_commands():
 
             if text == "/start":
                 bot_active = True
-                send_alert("🟢 BOT STARTED\nScanner is ACTIVE.")
+                send_alert("🟢 BOT STARTED\nTwo-Direction Engine Active.")
             elif text == "/stop":
                 bot_active = False
-                send_alert("🔴 BOT STOPPED\nScanner is PAUSED.")
+                send_alert("🔴 BOT STOPPED\nScanner Paused.")
             elif text == "/status":
                 status = "🟢 ACTIVE" if bot_active else "🔴 PAUSED"
                 mkt = "🟢 OPEN" if is_market_open() else "🔴 CLOSED"
-                open_str = "\n".join([f"• {k}: {v['option_name']} @ ₹{v['entry_spot']}" for k, v in active_positions.items()]) or "None"
+                open_str = "\n".join([f"• {k}: {v['option_name']} @ ₹{v['entry_spot']} (SL: ₹{v['sl_price']})" for k, v in active_positions.items()]) or "None"
+                pending_str = "\n".join([f"• {k}: {v['option_name']} waiting @ ₹{v['confirm_level']}" for k, v in pending_confirmations.items()]) or "None"
                 send_alert(
                     f"📊 **BOT STATUS**\n━━━━━━━━━━━━━━\n"
                     f"Bot: {status}\nMarket: {mkt}\nDate: {today_string()}\n"
                     f"Signals: {trades_count}/{MAX_DAILY_TRADES}\n"
-                    f"Open Positions:\n{open_str}\n"
+                    f"Active Trades:\n{open_str}\n"
+                    f"Pending Confirmations:\n{pending_str}\n"
                     f"Total P&L: {'+' if total_pnl >= 0 else ''}₹{total_pnl:,.2f}"
                 )
             elif text == "/pnl":
                 send_alert(
-                    f"💰 **TODAY'S P&L SUMMARY**\n━━━━━━━━━━━━━━\n"
+                    f"💰 **TODAY'S P&L REPORT**\n━━━━━━━━━━━━━━\n"
                     f"Date: {today_string()}\n"
-                    f"Completed Trades: {trades_count}/{MAX_DAILY_TRADES}\n"
+                    f"Trades Taken: {trades_count}/{MAX_DAILY_TRADES}\n"
                     f"Realized P&L: {'+' if total_pnl >= 0 else ''}₹{total_pnl:,.2f}\n"
-                    f"Active Trades: {len(active_positions)}"
+                    f"Open Positions: {len(active_positions)}"
                 )
             elif text == "/test":
                 rates = get_nse_live_prices()
                 n_price = rates.get("NIFTY", "N/A") if rates else "N/A"
-                send_alert(f"⚡ LIVE NSE TEST\nNIFTY 50: ₹{n_price}\nTracker engine is active!")
+                send_alert(f"⚡ LIVE NSE FEED\nNIFTY 50: ₹{n_price}\nTwo-Direction Strategy Active!")
             elif text == "/help":
-                send_alert("🤖 COMMANDS:\n/status - Bot status\n/pnl - Live profit/loss\n/test - Live NSE price\n/start - Resume\n/stop - Pause")
+                send_alert("🤖 COMMANDS:\n/status - Open trades & engine status\n/pnl - Net realized profit/loss\n/test - Live NSE tick check\n/start - Resume\n/stop - Pause")
     except Exception:
         pass
 
@@ -457,7 +542,12 @@ def main_trading_loop():
     global trade_date
     trade_date = today_string()
     initialize_csv()
-    send_alert("🚀 LIVE NSE TRACKER ONLINE\nTarget & Stoploss Engine Active with Real-Time P&L.")
+    send_alert(
+        "🚀 TWO-DIRECTION HEDGING ENGINE DEPLOYED\n"
+        "• Hammer (Bullish CE) & Hanging Man (Bearish PE)\n"
+        "• Confirmation Trigger Rule Active\n"
+        "• Dynamic Trailing SL & Hedging Shield Enabled"
+    )
 
     while True:
         try:
@@ -468,10 +558,13 @@ def main_trading_loop():
 
             rates = get_nse_live_prices()
             if rates:
-                # 1. Track Target & Stoploss for existing positions
+                # 1. Track Targets & Trailing SL for existing positions
                 track_open_positions(rates)
 
-                # 2. Analyze new signals if limit not reached
+                # 2. Check pending setups for confirmation breakout
+                process_pending_confirmations(rates)
+
+                # 3. Scan for new setups if under daily limit
                 if trades_count < MAX_DAILY_TRADES:
                     for name, info in WATCHLIST.items():
                         if name in rates:
@@ -483,7 +576,7 @@ def main_trading_loop():
             time.sleep(10)
 
 # ============================================================
-# MAIN EXECUTION
+# ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
