@@ -62,8 +62,9 @@ MIN_ADX_TREND = 20.0  # ADX < 20 means Choppy / Sideways market (No Trade Zone)
 SIGNAL_COOLDOWN_MINUTES = 15
 SCAN_INTERVAL_SECONDS = 15
 
-MARKET_OPEN = dt_time(9, 15)
-MARKET_CLOSE = dt_time(15, 30)
+# Trading Window: 09:30 થી 15:15 (Morning Volatility & Opening Trap થી બચવા)
+TRADE_START_TIME = dt_time(9, 30)
+TRADE_END_TIME = dt_time(15, 15)
 
 WATCHLIST = {
     "NIFTY": {
@@ -167,11 +168,12 @@ def now_ist():
 def today_string():
     return now_ist().strftime("%Y-%m-%d")
 
+# સવારે ૦૯:૩૦ પછી અને બપોરે ૧૫:૧૫ સુધી જ ટ્રેડ લેવાશે
 def is_market_open():
     now = now_ist()
     if now.weekday() >= 5:
         return False
-    return MARKET_OPEN <= now.time() <= MARKET_CLOSE
+    return TRADE_START_TIME <= now.time() <= TRADE_END_TIME
 
 def initialize_csv():
     if not os.path.exists(CSV_FILE):
@@ -215,6 +217,7 @@ def reset_daily_counter_if_needed():
             send_alert(
                 f"🌅 New Trading Day: {today}\n"
                 f"Daily Limit: {MAX_DAILY_TRADES}\n"
+                f"Trading Window: 09:30 AM to 03:15 PM\n"
                 f"Engine: Two-Direction + Trailing SL + ADX Sideways Filter 🛡️"
             )
 
@@ -232,10 +235,10 @@ def calculate_rsi(series, window=14):
     rs = avg_gain.iloc[-1] / avg_loss.iloc[-1]
     return float(100 - (100 / (1 + rs)))
 
+# ADX ગણતરી: પૂરતો ડેટા ન હોય તો ડિફોલ્ટ 0.0 જેથી શરૂઆતમાં ખોટો ટ્રેડ ન પડે
 def calculate_adx(series, period=14):
-    """Calculates Trend Strength (ADX) to avoid choppy sideways markets."""
     if len(series) < period * 2:
-        return 25.0  # Default neutral
+        return 0.0
     s = pd.Series(series)
     diff = s.diff()
     pos_dm = diff.clip(lower=0)
@@ -431,10 +434,9 @@ def analyze_index(index_name, current_spot, info):
         if index_name in active_positions or index_name in pending_confirmations or trades_count >= MAX_DAILY_TRADES:
             return
 
-    # 1. ADX CHOPPY / SIDEWAYS FILTER
+    # 1. ADX CHOPPY / SIDEWAYS FILTER (ADX < 20 means Sideways - No Trade)
     adx_val = calculate_adx(history, ADX_PERIOD)
     if adx_val < MIN_ADX_TREND:
-        # Market is choppy/sideways - Skip trades to avoid whipsaws
         return
 
     s = pd.Series(history)
@@ -532,7 +534,7 @@ def check_telegram_commands():
                 send_alert("🔴 BOT STOPPED\nScanner Paused.")
             elif text == "/status":
                 status = "🟢 ACTIVE" if bot_active else "🔴 PAUSED"
-                mkt = "🟢 OPEN" if is_market_open() else "🔴 CLOSED"
+                mkt = "🟢 OPEN" if is_market_open() else "🔴 CLOSED (Trade Window: 09:30-15:15)"
                 open_str = "\n".join([f"• {k}: {v['option_name']} @ ₹{v['entry_spot']} (SL: ₹{v['sl_price']})" for k, v in active_positions.items()]) or "None"
                 pending_str = "\n".join([f"• {k}: {v['option_name']} waiting @ ₹{v['confirm_level']}" for k, v in pending_confirmations.items()]) or "None"
                 send_alert(
@@ -554,7 +556,7 @@ def check_telegram_commands():
             elif text == "/test":
                 rates = get_nse_live_prices()
                 n_price = rates.get("NIFTY", "N/A") if rates else "N/A"
-                send_alert(f"⚡ LIVE NSE FEED\nNIFTY 50: ₹{n_price}\nADX Sideways Filter Active!")
+                send_alert(f"⚡ LIVE NSE FEED\nNIFTY 50: ₹{n_price}\nADX & Time Filter Active!")
             elif text == "/help":
                 send_alert("🤖 COMMANDS:\n/status - Open trades & engine status\n/pnl - Net realized profit/loss\n/test - Live NSE tick check\n/start - Resume\n/stop - Pause")
     except Exception:
@@ -571,6 +573,7 @@ def main_trading_loop():
     initialize_csv()
     send_alert(
         "🛡️ SIDEWAYS FILTER & TWO-DIRECTION ENGINE ACTIVE\n"
+        "• Trading Window: 09:30 AM to 03:15 PM (Morning Trap Blocked)\n"
         "• ADX Filter: Choppy / Sideways Markets Blocked (ADX < 20)\n"
         "• Hammer & Hanging Man Setups Activated\n"
         "• Trailing SL & Hedging Protection Enabled"
