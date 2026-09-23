@@ -44,7 +44,7 @@ def run_web():
 # ============================================================
 
 TIMEZONE = ZoneInfo("Asia/Kolkata")
-MAX_DAILY_TRADES = 2
+MAX_DAILY_TRADES = 5
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8797667594:AAFZRzm0KISq8z5_TLZupMMw0b3qGGREn-g").strip()
 CHAT_ID = os.environ.get("CHAT_ID", "1944447859").strip()
