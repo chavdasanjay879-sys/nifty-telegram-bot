@@ -518,8 +518,10 @@ def reset_daily_counter_if_needed():
     global pending_confirmations
 
     today = today_string()
+    message = None
 
     with state_lock:
+        # IMPORTANT: this block runs ONLY when the calendar date changes.
         if trade_date != today:
             trade_date = today
             trades_count = 0
@@ -532,15 +534,17 @@ def reset_daily_counter_if_needed():
                 "BANKNIFTY": []
             }
 
-            print(f"New trading day: {today}")
+            message = (
+                f"🌅 NEW TRADING DAY\n"
+                f"Date: {today}\n"
+                f"Engine: Multi-Layer Adaptive High Confidence\n"
+                f"Limit: {MAX_DAILY_TRADES} quality trades\n"
+                f"Mode: Single Direction Only"
+            )
 
-    send_alert(
-        f"🌅 NEW TRADING DAY\n"
-        f"Date: {today}\n"
-        f"Engine: Multi-Layer Adaptive High Confidence\n"
-        f"Limit: {MAX_DAILY_TRADES} quality trades\n"
-        f"Mode: Single Direction Only"
-    )
+    # Send exactly once per new date. Never send on every loop.
+    if message:
+        send_alert(message)
 
 
 # ============================================================
