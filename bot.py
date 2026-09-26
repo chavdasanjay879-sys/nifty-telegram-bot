@@ -11,14 +11,14 @@ import pandas as pd
 from flask import Flask
 
 # ============================================================
-# RENDER + FLASK WEB SERVER
+# WEB SERVER FOR RENDER 24x7
 # ============================================================
 
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Bot is running live 24x7 with ADX Sideways Filter & Two-Direction Hedging Engine!"
+    return "Single-Direction Sentiment Buying Engine Live 24x7!"
 
 @app.route("/health")
 def health():
@@ -32,63 +32,55 @@ def health():
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        use_reloader=False
-    )
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ============================================================
-# CONFIGURATION & PARAMETERS
+# CONFIGURATION
 # ============================================================
 
 TIMEZONE = ZoneInfo("Asia/Kolkata")
-MAX_DAILY_TRADES = 5
+MAX_DAILY_TRADES = 2  # Best 1 or 2 high probability quality setups only
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8797667594:AAFZRzm0KISq8z5_TLZupMMw0b3qGGREn-g").strip()
 CHAT_ID = os.environ.get("CHAT_ID", "1944447859").strip()
-
 CSV_FILE = "trade_log.csv"
 
-RSI_PERIOD = 14
-RSI_BULLISH = 55
-RSI_BEARISH = 45
+# Sentiment Parameters
+EMA_TREND = 50
 EMA_FAST = 9
 EMA_SLOW = 21
+RSI_PERIOD = 14
 ADX_PERIOD = 14
-MIN_ADX_TREND = 20.0  # ADX < 20 means Choppy / Sideways market (No Trade Zone)
+MIN_ADX_TREND = 25.0  # Strict: Flat market completely blocked
 
-SIGNAL_COOLDOWN_MINUTES = 15
+SIGNAL_COOLDOWN_MINUTES = 30
 SCAN_INTERVAL_SECONDS = 15
 
-# Trading Window: 09:30 થી 15:15 (Morning Volatility & Opening Trap થી બચવા)
-TRADE_START_TIME = dt_time(9, 30)
-TRADE_END_TIME = dt_time(15, 15)
+# Safe Trading Timing (Opening 30 min traps avoided)
+TRADE_START_TIME = dt_time(9, 45)
+TRADE_END_TIME = dt_time(14, 45)
 
 WATCHLIST = {
     "NIFTY": {
         "symbol": "NIFTY 50",
         "lot_size": 75,
         "step": 50,
-        "target_pts": 45,
-        "initial_sl_pts": 18,
-        "trail_trigger_pts": 20,
-        "hedge_offset": 300
+        "target_pts": 50,
+        "initial_sl_pts": 16,
+        "trail_trigger_pts": 20
     },
     "BANKNIFTY": {
         "symbol": "NIFTY BANK",
         "lot_size": 30,
         "step": 100,
-        "target_pts": 90,
+        "target_pts": 100,
         "initial_sl_pts": 35,
-        "trail_trigger_pts": 40,
-        "hedge_offset": 600
+        "trail_trigger_pts": 40
     }
 }
 
 # ============================================================
-# GLOBAL STATE
+# GLOBAL ENGINE STATE
 # ============================================================
 
 bot_active = True
@@ -105,7 +97,7 @@ price_history = {"NIFTY": [], "BANKNIFTY": []}
 state_lock = threading.Lock()
 
 # ============================================================
-# TELEGRAM NOTIFICATIONS
+# TELEGRAM ALERTS
 # ============================================================
 
 def send_alert(message):
@@ -115,26 +107,25 @@ def send_alert(message):
         res = requests.post(url, data=payload, timeout=10)
         return res.status_code == 200
     except Exception as e:
-        print(f"Telegram send error: {e}")
+        print(f"Telegram error: {e}")
         return False
 
 # ============================================================
-# REAL-TIME NSE LIVE DATA FETCHER
+# NSE REAL-TIME DATA
 # ============================================================
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.nseindia.com/"
 })
 
 def init_nse_session():
     try:
         session.get("https://www.nseindia.com", timeout=10)
-    except Exception as e:
-        print(f"NSE session init error: {e}")
+    except Exception:
+        pass
 
 init_nse_session()
 
@@ -155,11 +146,11 @@ def get_nse_live_prices():
                     rates["BANKNIFTY"] = float(str(item.get("last", "0")).replace(",", ""))
             return rates
     except Exception as e:
-        print(f"Live data fetch error: {e}")
+        print(f"NSE feed err: {e}")
     return None
 
 # ============================================================
-# HELPERS & TECHNICAL FORMULAS
+# HELPERS & FORMULAS
 # ============================================================
 
 def now_ist():
@@ -168,58 +159,11 @@ def now_ist():
 def today_string():
     return now_ist().strftime("%Y-%m-%d")
 
-# સવારે ૦૯:૩૦ પછી અને બપોરે ૧૫:૧૫ સુધી જ ટ્રેડ લેવાશે
 def is_market_open():
     now = now_ist()
     if now.weekday() >= 5:
         return False
     return TRADE_START_TIME <= now.time() <= TRADE_END_TIME
-
-def initialize_csv():
-    if not os.path.exists(CSV_FILE):
-        try:
-            with open(CSV_FILE, mode="w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(["Date", "Entry_Time", "Exit_Time", "Asset", "Option", "Entry_Spot", "Exit_Spot", "Result", "PnL"])
-        except Exception as e:
-            print(f"CSV init error: {e}")
-
-def log_trade_to_csv(pos, exit_spot, result, pnl):
-    try:
-        with open(CSV_FILE, mode="a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                pos["date"],
-                pos["entry_time"],
-                now_ist().strftime("%H:%M:%S"),
-                pos["asset"],
-                pos["option_name"],
-                pos["entry_spot"],
-                exit_spot,
-                result,
-                f"{pnl:.2f}"
-            ])
-    except Exception as e:
-        print(f"CSV log error: {e}")
-
-def reset_daily_counter_if_needed():
-    global trades_count, trade_date, last_signal_time, price_history, total_pnl, active_positions, pending_confirmations
-    today = today_string()
-    with state_lock:
-        if trade_date != today:
-            trade_date = today
-            trades_count = 0
-            total_pnl = 0.0
-            last_signal_time = {}
-            active_positions = {}
-            pending_confirmations = {}
-            price_history = {"NIFTY": [], "BANKNIFTY": []}
-            send_alert(
-                f"🌅 New Trading Day: {today}\n"
-                f"Daily Limit: {MAX_DAILY_TRADES}\n"
-                f"Trading Window: 09:30 AM to 03:15 PM\n"
-                f"Engine: Two-Direction + Trailing SL + ADX Sideways Filter 🛡️"
-            )
 
 def calculate_rsi(series, window=14):
     if len(series) < window + 1:
@@ -235,7 +179,6 @@ def calculate_rsi(series, window=14):
     rs = avg_gain.iloc[-1] / avg_loss.iloc[-1]
     return float(100 - (100 / (1 + rs)))
 
-# ADX ગણતરી: પૂરતો ડેટા ન હોય તો ડિફોલ્ટ 0.0 જેથી શરૂઆતમાં ખોટો ટ્રેડ ન પડે
 def calculate_adx(series, period=14):
     if len(series) < period * 2:
         return 0.0
@@ -244,11 +187,9 @@ def calculate_adx(series, period=14):
     pos_dm = diff.clip(lower=0)
     neg_dm = (-diff).clip(lower=0)
     tr = diff.abs()
-
     atr = tr.ewm(span=period, adjust=False).mean()
     pos_di = 100 * (pos_dm.ewm(span=period, adjust=False).mean() / (atr + 1e-6))
     neg_di = 100 * (neg_dm.ewm(span=period, adjust=False).mean() / (atr + 1e-6))
-
     dx = 100 * (pos_di - neg_di).abs() / (pos_di + neg_di + 1e-6)
     adx = dx.ewm(span=period, adjust=False).mean().iloc[-1]
     return float(adx)
@@ -256,15 +197,22 @@ def calculate_adx(series, period=14):
 def get_atm_strike(spot, step):
     return int(round(spot / step) * step)
 
-def signal_allowed(index_name):
-    now = now_ist()
-    prev = last_signal_time.get(index_name)
-    if prev is None:
-        return True
-    return (now - prev).total_seconds() / 60 >= SIGNAL_COOLDOWN_MINUTES
+def reset_daily_counter_if_needed():
+    global trades_count, trade_date, last_signal_time, price_history, total_pnl, active_positions, pending_confirmations
+    today = today_string()
+    with state_lock:
+        if trade_date != today:
+            trade_date = today
+            trades_count = 0
+            total_pnl = 0.0
+            last_signal_time = {}
+            active_positions = {}
+            pending_confirmations = {}
+            price_history = {"NIFTY": [], "BANKNIFTY": []}
+            send_alert(f"🌅 New Trading Day: {today}\nSystem: Single-Direction Sentiment Engine\nLimit: {MAX_DAILY_TRADES} High-Probability Trades")
 
 # ============================================================
-# LIVE POSITION & TRAILING SL ENGINE
+# LIVE POSITION TRACKER & TRAILING SL ENGINE
 # ============================================================
 
 def track_open_positions(rates):
@@ -281,14 +229,12 @@ def track_open_positions(rates):
 
             if pos["direction"] == "BULLISH":  # CE
                 gain_pts = current_spot - pos["entry_spot"]
-
-                # Trailing SL Trigger: Shift SL to Entry Spot or higher
                 if gain_pts >= pos["trail_trigger_pts"]:
-                    new_sl = round(pos["entry_spot"] + (gain_pts - pos["trail_trigger_pts"]) * 0.5, 2)
+                    new_sl = round(pos["entry_spot"] + (gain_pts - pos["trail_trigger_pts"]) * 0.6, 2)
                     if new_sl > pos["sl_price"]:
                         pos["sl_price"] = new_sl
                         pos["is_trailed"] = True
-                        send_alert(f"🛡️ TRAILING SL SHIFTED\nAsset: {index_name} CE\nNew Trailing SL: ₹{pos['sl_price']:,.2f} (Profits Protected!)")
+                        send_alert(f"🛡️ TRAILING SL SHIFTED\n{index_name} CE Lock Level: ₹{pos['sl_price']:,.2f}")
 
                 if current_spot >= pos["target_price"]:
                     hit_target = True
@@ -297,14 +243,12 @@ def track_open_positions(rates):
 
             else:  # PE
                 gain_pts = pos["entry_spot"] - current_spot
-
-                # Trailing SL Trigger for PE
                 if gain_pts >= pos["trail_trigger_pts"]:
-                    new_sl = round(pos["entry_spot"] - (gain_pts - pos["trail_trigger_pts"]) * 0.5, 2)
+                    new_sl = round(pos["entry_spot"] - (gain_pts - pos["trail_trigger_pts"]) * 0.6, 2)
                     if new_sl < pos["sl_price"]:
                         pos["sl_price"] = new_sl
                         pos["is_trailed"] = True
-                        send_alert(f"🛡️ TRAILING SL SHIFTED\nAsset: {index_name} PE\nNew Trailing SL: ₹{pos['sl_price']:,.2f} (Profits Protected!)")
+                        send_alert(f"🛡️ TRAILING SL SHIFTED\n{index_name} PE Lock Level: ₹{pos['sl_price']:,.2f}")
 
                 if current_spot <= pos["target_price"]:
                     hit_target = True
@@ -315,50 +259,37 @@ def track_open_positions(rates):
                 pnl = pos["target_pts"] * pos["lot_size"]
                 total_pnl += pnl
                 msg = (
-                    f"🎯 **TARGET HIT!** 🚀\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"Asset: {index_name}\n"
-                    f"Trade: {pos['option_name']}\n"
-                    f"Entry Spot: ₹{pos['entry_spot']:,.2f}\n"
-                    f"Exit Spot: ₹{current_spot:,.2f}\n"
-                    f"Time: {now_ist().strftime('%H:%M:%S')} IST\n"
+                    f"🎯 **TARGET ACHIEVED!** 🏆\n"
+                    f"Asset: {index_name} | {pos['option_name']}\n"
+                    f"Entry: ₹{pos['entry_spot']:,.2f} ➔ Exit: ₹{current_spot:,.2f}\n"
                     f"Gain: +{pos['target_pts']} pts\n"
-                    f"💵 **Trade Profit: +₹{pnl:,.2f}**\n"
-                    f"📊 **Day Total P&L: {'+' if total_pnl >= 0 else ''}₹{total_pnl:,.2f}**\n"
-                    f"━━━━━━━━━━━━━━━━━━"
+                    f"💵 Trade Profit: +₹{pnl:,.2f}\n"
+                    f"Total P&L: {'+' if total_pnl >= 0 else ''}₹{total_pnl:,.2f}"
                 )
                 send_alert(msg)
-                log_trade_to_csv(pos, current_spot, "TARGET_HIT", pnl)
                 closed_indices.append(index_name)
 
             elif hit_sl:
                 exit_diff = (current_spot - pos["entry_spot"]) if pos["direction"] == "BULLISH" else (pos["entry_spot"] - current_spot)
                 pnl = exit_diff * pos["lot_size"]
                 total_pnl += pnl
-                res_type = "TRAILED_EXIT" if pos.get("is_trailed") and pnl >= 0 else "STOPLOSS_HIT"
-
+                is_lock = pos.get("is_trailed") and pnl >= 0
                 msg = (
-                    f"{'🛡️ PROTECTED TRAILED EXIT' if res_type == 'TRAILED_EXIT' else '🛑 STOPLOSS HIT! ⚠️'}\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"Asset: {index_name}\n"
-                    f"Trade: {pos['option_name']}\n"
-                    f"Entry Spot: ₹{pos['entry_spot']:,.2f}\n"
-                    f"Exit Spot: ₹{current_spot:,.2f}\n"
-                    f"Time: {now_ist().strftime('%H:%M:%S')} IST\n"
-                    f"Diff: {exit_diff:+.2f} pts\n"
-                    f"{'💵 Trade Gain: +' if pnl >= 0 else '💸 Trade Loss: -'}₹{abs(pnl):,.2f}\n"
-                    f"📊 **Day Total P&L: {'+' if total_pnl >= 0 else ''}₹{total_pnl:,.2f}**\n"
-                    f"━━━━━━━━━━━━━━━━━━"
+                    f"{'🛡️ PROFIT PROTECTED EXIT' if is_lock else '🛑 STRICT STOPLOSS EXIT'}\n"
+                    f"Asset: {index_name} | {pos['option_name']}\n"
+                    f"Entry: ₹{pos['entry_spot']:,.2f} ➔ Exit: ₹{current_spot:,.2f}\n"
+                    f"Points: {exit_diff:+.2f} pts\n"
+                    f"P&L: {'+' if pnl >= 0 else '-'}₹{abs(pnl):,.2f}\n"
+                    f"Total P&L: {'+' if total_pnl >= 0 else ''}₹{total_pnl:,.2f}"
                 )
                 send_alert(msg)
-                log_trade_to_csv(pos, current_spot, res_type, pnl)
                 closed_indices.append(index_name)
 
         for idx in closed_indices:
             del active_positions[idx]
 
 # ============================================================
-# TWO-DIRECTION STRATEGY WITH ADX FILTER & CONFIRMATION
+# SENTIMENT PREDICTION & CONFIRMATION ENGINE
 # ============================================================
 
 def process_pending_confirmations(rates):
@@ -370,18 +301,17 @@ def process_pending_confirmations(rates):
             if not spot or trades_count >= MAX_DAILY_TRADES:
                 continue
 
-            is_bull_confirmed = (p["direction"] == "BULLISH" and spot > p["confirm_level"])
-            is_bear_confirmed = (p["direction"] == "BEARISH" and spot < p["confirm_level"])
+            is_bull = (p["direction"] == "BULLISH" and spot >= p["confirm_level"])
+            is_bear = (p["direction"] == "BEARISH" and spot <= p["confirm_level"])
 
-            if is_bull_confirmed or is_bear_confirmed:
+            if is_bull or is_bear:
                 trades_count += 1
                 last_signal_time[index_name] = now_ist()
-                current_num = trades_count
 
                 target_pts = p["target_pts"]
                 sl_pts = p["sl_pts"]
-                target_price = round(spot + target_pts if p["direction"] == "BULLISH" else spot - target_pts, 2)
-                sl_price = round(spot - sl_pts if p["direction"] == "BULLISH" else spot + sl_pts, 2)
+                target_price = round(spot + target_pts if is_bull else spot - target_pts, 2)
+                sl_price = round(spot - sl_pts if is_bull else spot + sl_pts, 2)
 
                 active_positions[index_name] = {
                     "asset": index_name,
@@ -400,20 +330,14 @@ def process_pending_confirmations(rates):
                 }
 
                 alert = (
-                    f"⚡ **ORDER EXECUTED (CONFIRMED)**\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"Pattern: {p['pattern']} Activated!\n"
+                    f"⚡ **HIGH PROBABILITY ORDER EXECUTED**\n"
                     f"Asset: {index_name}\n"
-                    f"Time: {now_ist().strftime('%H:%M:%S')} IST\n"
-                    f"Action: **BUY {p['option_name']}**\n"
+                    f"Action: **BUY {p['option_name']}** (Single Direction)\n"
                     f"Entry Spot: ₹{spot:,.2f}\n"
-                    f"ADX Strength: {p['adx']:.1f} (Trend Confirmed)\n"
+                    f"Sentiment: {p['sentiment']} | ADX: {p['adx']:.1f}\n"
                     f"🎯 Target: ₹{target_price:,.2f} (+{target_pts} pts)\n"
-                    f"🛑 Initial SL: ₹{sl_price:,.2f} (-{sl_pts} pts)\n"
-                    f"🛡️ **Hedging Shield:** Active ({p['hedge_symbol']})\n"
-                    f"Trade #{current_num}/{MAX_DAILY_TRADES}\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📌 Trailing SL activates at +{p['trail_trigger_pts']} pts"
+                    f"🛑 Stoploss: ₹{sl_price:,.2f} (-{sl_pts} pts)\n"
+                    f"Trade #{trades_count}/{MAX_DAILY_TRADES}"
                 )
                 send_alert(alert)
                 confirmed.append(index_name)
@@ -424,96 +348,91 @@ def process_pending_confirmations(rates):
 def analyze_index(index_name, current_spot, info):
     history = price_history[index_name]
     history.append(current_spot)
-    if len(history) > 100:
+    if len(history) > 120:
         history.pop(0)
 
-    if len(history) < EMA_SLOW + 2:
+    if len(history) < EMA_TREND + 5:
         return
 
     with state_lock:
         if index_name in active_positions or index_name in pending_confirmations or trades_count >= MAX_DAILY_TRADES:
             return
 
-    # 1. ADX CHOPPY / SIDEWAYS FILTER (ADX < 20 means Sideways - No Trade)
+    # 1. ADX Strict Trend Filter (Must be > 25)
     adx_val = calculate_adx(history, ADX_PERIOD)
     if adx_val < MIN_ADX_TREND:
         return
 
     s = pd.Series(history)
-    ema_fast = round(float(s.ewm(span=EMA_FAST, adjust=False).mean().iloc[-1]), 2)
-    ema_slow = round(float(s.ewm(span=EMA_SLOW, adjust=False).mean().iloc[-1]), 2)
+    ema_trend = float(s.ewm(span=EMA_TREND, adjust=False).mean().iloc[-1])
+    ema_fast = float(s.ewm(span=EMA_FAST, adjust=False).mean().iloc[-1])
+    ema_slow = float(s.ewm(span=EMA_SLOW, adjust=False).mean().iloc[-1])
     rsi_val = calculate_rsi(history, RSI_PERIOD)
-    rsi = round(rsi_val, 2) if rsi_val is not None else 50.0
-
-    recent_high = max(history[-5:])
-    recent_low = min(history[-5:])
-
-    # Directional setups
-    bullish_setup = (current_spot > ema_fast > ema_slow and rsi >= RSI_BULLISH)
-    bearish_setup = (current_spot < ema_fast < ema_slow and rsi <= RSI_BEARISH)
-
-    if not bullish_setup and not bearish_setup:
+    if rsi_val is None:
         return
 
-    if not signal_allowed(index_name):
+    recent_high = max(history[-6:])
+    recent_low = min(history[-6:])
+
+    # STRICT SENTIMENT ALIGNMENT (No Both-Side Buying)
+    # ONLY CE: Price > 50 EMA AND 9 EMA > 21 EMA AND RSI Healthy (58 - 68)
+    bullish_condition = (current_spot > ema_trend) and (ema_fast > ema_slow) and (58 <= rsi_val <= 68)
+
+    # ONLY PE: Price < 50 EMA AND 9 EMA < 21 EMA AND RSI Healthy (32 - 42)
+    bearish_condition = (current_spot < ema_trend) and (ema_fast < ema_slow) and (32 <= rsi_val <= 42)
+
+    if not bullish_condition and not bearish_condition:
         return
 
-    step = info["step"]
-    atm_strike = get_atm_strike(current_spot, step)
+    prev = last_signal_time.get(index_name)
+    if prev and (now_ist() - prev).total_seconds() / 60 < SIGNAL_COOLDOWN_MINUTES:
+        return
 
-    if bullish_setup:
+    atm_strike = get_atm_strike(current_spot, info["step"])
+
+    if bullish_condition:
         direction = "BULLISH"
-        pattern = "📈 Bullish Momentum / Hammer"
+        sentiment = "STRONG BULL REGIME"
         opt_name = f"{index_name} {atm_strike} CE"
-        confirm_level = round(recent_high + 2.0, 2)
-        hedge_strike = atm_strike + info["hedge_offset"]
-        hedge_symbol = f"{index_name} {hedge_strike} PE (Shield)"
+        confirm_level = round(recent_high + 2.5, 2)
     else:
         direction = "BEARISH"
-        pattern = "📉 Bearish Hanging Man / Breakdown"
+        sentiment = "STRONG BEAR REGIME"
         opt_name = f"{index_name} {atm_strike} PE"
-        confirm_level = round(recent_low - 2.0, 2)
-        hedge_strike = atm_strike - info["hedge_offset"]
-        hedge_symbol = f"{index_name} {hedge_strike} CE (Shield)"
+        confirm_level = round(recent_low - 2.5, 2)
 
     with state_lock:
         pending_confirmations[index_name] = {
             "direction": direction,
-            "pattern": pattern,
+            "sentiment": sentiment,
             "option_name": opt_name,
             "confirm_level": confirm_level,
             "target_pts": info["target_pts"],
             "sl_pts": info["initial_sl_pts"],
             "trail_trigger_pts": info["trail_trigger_pts"],
             "lot_size": info["lot_size"],
-            "hedge_symbol": hedge_symbol,
             "adx": adx_val
         }
 
-    setup_msg = (
-        f"🔍 **SETUP DETECTED (ADX {adx_val:.1f} TRENDING)**\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
+    send_alert(
+        f"🔍 **HIGH PROBABILITY SETUP DETECTED**\n"
         f"Asset: {index_name}\n"
-        f"Pattern: {pattern}\n"
-        f"Target Strike: {opt_name}\n"
-        f"Current Spot: ₹{current_spot:,.2f}\n"
-        f"Trigger Level: {'Break Above' if direction == 'BULLISH' else 'Break Below'} ₹{confirm_level:,.2f}\n"
-        f"🛡️ Hedging Shield: {hedge_symbol}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"Bot will execute trade once trigger level breaks!"
+        f"Candidate: **BUY {opt_name} ONLY**\n"
+        f"Sentiment: {sentiment}\n"
+        f"Trigger Level: ₹{confirm_level:,.2f}\n"
+        f"ADX: {adx_val:.1f} | RSI: {rsi_val:.1f}\n"
+        f"Waiting for breakout confirmation..."
     )
-    send_alert(setup_msg)
 
 # ============================================================
-# TELEGRAM COMMANDS THREAD
+# COMMANDS & MAIN LOOP
 # ============================================================
 
 def check_telegram_commands():
     global bot_active, last_update_id
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-        params = {"offset": last_update_id + 1, "timeout": 1}
-        res = requests.get(url, params=params, timeout=5)
+        res = requests.get(url, params={"offset": last_update_id + 1, "timeout": 1}, timeout=5)
         if res.status_code != 200:
             return
 
@@ -522,43 +441,14 @@ def check_telegram_commands():
             msg = update.get("message", {})
             text = msg.get("text", "").strip().lower()
             sender = str(msg.get("chat", {}).get("id", ""))
-
             if sender != CHAT_ID:
                 continue
 
-            if text == "/start":
-                bot_active = True
-                send_alert("🟢 BOT STARTED\nADX Filter + Two-Direction Engine Active.")
-            elif text == "/stop":
-                bot_active = False
-                send_alert("🔴 BOT STOPPED\nScanner Paused.")
+            if text == "/pnl":
+                send_alert(f"💰 **P&L SUMMARY**\nTrades: {trades_count}/{MAX_DAILY_TRADES}\nRealized P&L: {'+' if total_pnl >= 0 else ''}₹{total_pnl:,.2f}")
             elif text == "/status":
-                status = "🟢 ACTIVE" if bot_active else "🔴 PAUSED"
-                mkt = "🟢 OPEN" if is_market_open() else "🔴 CLOSED (Trade Window: 09:30-15:15)"
-                open_str = "\n".join([f"• {k}: {v['option_name']} @ ₹{v['entry_spot']} (SL: ₹{v['sl_price']})" for k, v in active_positions.items()]) or "None"
-                pending_str = "\n".join([f"• {k}: {v['option_name']} waiting @ ₹{v['confirm_level']}" for k, v in pending_confirmations.items()]) or "None"
-                send_alert(
-                    f"📊 **BOT STATUS**\n━━━━━━━━━━━━━━\n"
-                    f"Bot: {status}\nMarket: {mkt}\nDate: {today_string()}\n"
-                    f"Signals: {trades_count}/{MAX_DAILY_TRADES}\n"
-                    f"Active Trades:\n{open_str}\n"
-                    f"Pending Confirmations:\n{pending_str}\n"
-                    f"Total P&L: {'+' if total_pnl >= 0 else ''}₹{total_pnl:,.2f}"
-                )
-            elif text == "/pnl":
-                send_alert(
-                    f"💰 **TODAY'S P&L REPORT**\n━━━━━━━━━━━━━━\n"
-                    f"Date: {today_string()}\n"
-                    f"Trades Taken: {trades_count}/{MAX_DAILY_TRADES}\n"
-                    f"Realized P&L: {'+' if total_pnl >= 0 else ''}₹{total_pnl:,.2f}\n"
-                    f"Open Positions: {len(active_positions)}"
-                )
-            elif text == "/test":
-                rates = get_nse_live_prices()
-                n_price = rates.get("NIFTY", "N/A") if rates else "N/A"
-                send_alert(f"⚡ LIVE NSE FEED\nNIFTY 50: ₹{n_price}\nADX & Time Filter Active!")
-            elif text == "/help":
-                send_alert("🤖 COMMANDS:\n/status - Open trades & engine status\n/pnl - Net realized profit/loss\n/test - Live NSE tick check\n/start - Resume\n/stop - Pause")
+                open_str = "\n".join([f"• {k}: {v['option_name']} (SL: ₹{v['sl_price']})" for k, v in active_positions.items()]) or "None"
+                send_alert(f"📊 BOT: {'ACTIVE' if bot_active else 'PAUSED'}\nTrades: {trades_count}/{MAX_DAILY_TRADES}\nOpen: {open_str}\nP&L: {'+' if total_pnl >= 0 else ''}₹{total_pnl:,.2f}")
     except Exception:
         pass
 
@@ -570,31 +460,19 @@ def telegram_loop():
 def main_trading_loop():
     global trade_date
     trade_date = today_string()
-    initialize_csv()
-    send_alert(
-        "🛡️ SIDEWAYS FILTER & TWO-DIRECTION ENGINE ACTIVE\n"
-        "• Trading Window: 09:30 AM to 03:15 PM (Morning Trap Blocked)\n"
-        "• ADX Filter: Choppy / Sideways Markets Blocked (ADX < 20)\n"
-        "• Hammer & Hanging Man Setups Activated\n"
-        "• Trailing SL & Hedging Protection Enabled"
-    )
+    send_alert("🚀 SINGLE-DIRECTION HIGH CONFIDENCE ENGINE ONLINE\n• Macro 50 EMA Alignment\n• ADX 25+ Trend Filter\n• Single Side Buying Only (No Straddles)")
 
     while True:
         try:
             reset_daily_counter_if_needed()
             if not bot_active or not is_market_open():
-                time.sleep(30)
+                time.sleep(20)
                 continue
 
             rates = get_nse_live_prices()
             if rates:
-                # 1. Track Targets & Trailing SL for existing positions
                 track_open_positions(rates)
-
-                # 2. Check pending setups for confirmation breakout
                 process_pending_confirmations(rates)
-
-                # 3. Scan for new setups if under daily limit
                 if trades_count < MAX_DAILY_TRADES:
                     for name, info in WATCHLIST.items():
                         if name in rates:
@@ -605,15 +483,7 @@ def main_trading_loop():
             print(f"Main loop err: {e}")
             time.sleep(10)
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
-
 if __name__ == "__main__":
-    t_thread = threading.Thread(target=telegram_loop, daemon=True)
-    t_thread.start()
-
-    scanner_thread = threading.Thread(target=main_trading_loop, daemon=True)
-    scanner_thread.start()
-
+    threading.Thread(target=telegram_loop, daemon=True).start()
+    threading.Thread(target=main_trading_loop, daemon=True).start()
     run_web()
