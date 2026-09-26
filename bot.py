@@ -983,6 +983,9 @@ def check_telegram_commands():
                 bot_active = True
                 send_alert("▶️ NEW SIGNALS RESUMED.")
 
+    except Exception as e:
+        print(f"Telegram command error: {e}")
+
 
 def telegram_loop():
     while True:
