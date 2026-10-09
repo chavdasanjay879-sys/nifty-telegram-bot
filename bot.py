@@ -1,5 +1,6 @@
 import os
 import time
+import csv
 import threading
 from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
@@ -9,1076 +10,794 @@ import numpy as np
 import pandas as pd
 from flask import Flask, jsonify
 
-# ============================================================
-# MULTI-LAYER ADAPTIVE HIGH-CONFIDENCE ENGINE
-# NSE + TELEGRAM + RENDER 24x7
-#
-# IMPORTANT:
-# - Set BOT_TOKEN and CHAT_ID in Render Environment Variables.
-# - This program sends Telegram alerts only. It does NOT place
-#   real broker orders.
-# - Targets/SL/P&L are calculated from INDEX SPOT points, not
-#   option premium.
-# ============================================================
+TZ = ZoneInfo("Asia/Kolkata")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
+PORT = int(os.getenv("PORT", "10000"))
 
-app = Flask(__name__)
+WATCHLIST = {
+    "NIFTY": {
+        "index_name": "NIFTY 50",
+        "lot_size": int(os.getenv("NIFTY_LOT_SIZE", "65")),
+        "strike_step": 50,
+    },
+    "BANKNIFTY": {
+        "index_name": "NIFTY BANK",
+        "lot_size": int(os.getenv("BANKNIFTY_LOT_SIZE", "30")),
+        "strike_step": 100,
+    },
+}
 
-# -------------------- WEB SERVER -----------------------------
-
-@app.route("/")
-def home():
-    return "Multi-Layer Adaptive High-Confidence Engine Live 24x7!"
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "ok",
-        "bot_active": bot_active,
-        "trades_today": trades_count,
-        "daily_limit": MAX_DAILY_TRADES,
-        "total_pnl": round(total_pnl, 2),
-        "open_positions": list(active_positions.keys()),
-        "pending_setups": list(pending_confirmations.keys())
-    })
-
-def run_web():
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-TIMEZONE = ZoneInfo("Asia/Kolkata")
-
-MAX_DAILY_TRADES = 2
-MIN_CONFIDENCE = 85.0
-
+LOTS_PER_TRADE = 3
+MAX_DAILY_TRADES = 5
+MIN_CONFIDENCE = 80.0
 EMA_TREND = 50
 EMA_FAST = 9
 EMA_SLOW = 21
 RSI_PERIOD = 14
-ADX_PERIOD = 14
+MIN_TREND_STRENGTH = 18.0
+SCAN_INTERVAL_SECONDS = 20
 
-MIN_ADX_TREND = 25.0
-SIGNAL_COOLDOWN_MINUTES = 30
-SETUP_EXPIRY_MINUTES = 5
-SCAN_INTERVAL_SECONDS = 15
+TRADE_START = dt_time(9, 30)
+TRADE_END = dt_time(14, 45)
+FORCE_EXIT_TIME = dt_time(15, 15)
 
-TRADE_START_TIME = dt_time(9, 45)
-TRADE_END_TIME = dt_time(14, 45)
+TARGET_PCT = 0.10
+STOPLOSS_PCT = 0.08
+TRAIL_START_PCT = 0.06
+TRAIL_GIVEBACK_PCT = 0.03
+MAX_DAILY_LOSS_RUPEES = 3000.0
+MIN_OPTION_PREMIUM = 10.0
+CSV_FILE = "paper_trade_log.csv"
 
-# Read secrets only from environment variables.
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-CHAT_ID = os.environ.get("CHAT_ID", "").strip()
-
-CSV_FILE = "trade_log.csv"
-
-WATCHLIST = {
-    "NIFTY": {
-        "symbol": "NIFTY 50",
-        "lot_size": 75,
-        "step": 50,
-        "target_pts": 50,
-        "initial_sl_pts": 16,
-        "trail_trigger_pts": 20,
-    },
-    "BANKNIFTY": {
-        "symbol": "NIFTY BANK",
-        "lot_size": 30,
-        "step": 100,
-        "target_pts": 100,
-        "initial_sl_pts": 35,
-        "trail_trigger_pts": 40,
-    },
-}
-
-
-# ============================================================
-# GLOBAL STATE
-# ============================================================
+app = Flask(__name__)
+lock = threading.RLock()
+http = requests.Session()
+http.headers.update({
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.nseindia.com/",
+})
 
 bot_active = True
-last_update_id = 0
-trades_count = 0
 trade_date = None
-last_signal_time = {}
-total_pnl = 0.0
-
-active_positions = {}
-pending_confirmations = {}
-
-price_history = {
-    "NIFTY": [],
-    "BANKNIFTY": [],
-}
-
-state_lock = threading.RLock()
+trades_today = 0
+realized_pnl = 0.0
+price_history = {key: [] for key in WATCHLIST}
+open_positions = {}
+last_signal_at = {}
+last_alert_keys = set()
+last_update_id = 0
+market_data_last_ok = None
 
 
-# ============================================================
-# TELEGRAM
-# ============================================================
+@app.route("/")
+def home():
+    return "Option Buying Paper Bot Running — No Real Orders"
+
+
+@app.route("/health")
+def health():
+    with lock:
+        return jsonify({
+            "status": "ok",
+            "mode": "paper_only",
+            "active": bot_active,
+            "trades_today": trades_today,
+            "daily_limit": MAX_DAILY_TRADES,
+            "realized_pnl": round(realized_pnl, 2),
+            "daily_loss_limit": MAX_DAILY_LOSS_RUPEES,
+            "open_positions": list(open_positions.keys()),
+            "last_market_data": market_data_last_ok,
+        })
+
+
+def now():
+    return datetime.now(TZ)
+
 
 def telegram_ready():
     return bool(BOT_TOKEN and CHAT_ID)
 
 
-def send_alert(message):
+def send_alert(message, dedupe_key=None):
+    if dedupe_key:
+        with lock:
+            if dedupe_key in last_alert_keys:
+                return False
+            last_alert_keys.add(dedupe_key)
+
     if not telegram_ready():
-        print("Telegram is not configured. Set BOT_TOKEN and CHAT_ID.")
+        print(message)
         return False
 
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": CHAT_ID,
-            "text": message
-        }
-        res = requests.post(url, data=payload, timeout=10)
-        if res.status_code != 200:
-            print(f"Telegram HTTP {res.status_code}: {res.text[:300]}")
-        return res.status_code == 200
-    except Exception as e:
-        print(f"Telegram error: {e}")
+        response = requests.post(
+            url,
+            data={"chat_id": CHAT_ID, "text": message},
+            timeout=10,
+        )
+        return response.status_code == 200
+    except requests.RequestException as exc:
+        print("Telegram error:", exc)
         return False
 
 
-# ============================================================
-# NSE LIVE DATA
-# ============================================================
-
-session = requests.Session()
-session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "*/*",
-    "Referer": "https://www.nseindia.com/"
-})
-
-
-def init_nse_session():
-    try:
-        session.get("https://www.nseindia.com", timeout=10)
-    except Exception:
-        pass
-
-
-def get_nse_live_prices():
-    url = "https://www.nseindia.com/api/allIndices"
+def fetch_index_spots():
+    global market_data_last_ok
 
     try:
-        res = session.get(url, timeout=10)
+        response = http.get(
+            "https://www.nseindia.com/api/allIndices",
+            timeout=10,
+        )
+        if response.status_code in (401, 403):
+            http.get("https://www.nseindia.com", timeout=8)
+            response = http.get(
+                "https://www.nseindia.com/api/allIndices",
+                timeout=10,
+            )
 
-        if res.status_code in (401, 403):
-            init_nse_session()
-            res = session.get(url, timeout=10)
+        response.raise_for_status()
+        items = response.json().get("data", [])
+        result = {}
 
-        if res.status_code != 200:
-            print(f"NSE HTTP {res.status_code}")
-            return None
-
-        data = res.json().get("data", [])
-        rates = {}
-
-        for item in data:
+        for item in items:
             name = item.get("index")
-            last = item.get("last")
-
-            try:
-                value = float(str(last).replace(",", ""))
-            except Exception:
+            if name not in ("NIFTY 50", "NIFTY BANK"):
                 continue
 
-            if name == "NIFTY 50":
-                rates["NIFTY"] = value
-            elif name == "NIFTY BANK":
-                rates["BANKNIFTY"] = value
+            try:
+                value = float(str(item.get("last")).replace(",", ""))
+            except (TypeError, ValueError):
+                continue
 
-        return rates or None
+            key = "NIFTY" if name == "NIFTY 50" else "BANKNIFTY"
+            result[key] = value
 
-    except Exception as e:
-        print(f"NSE feed error: {e}")
+        if result:
+            market_data_last_ok = now().isoformat(timespec="seconds")
+            return result
+
+    except (requests.RequestException, ValueError) as exc:
+        print("NSE index feed error:", exc)
+
+    return None
+
+
+def fetch_option_chain(index_key):
+    symbol = "NIFTY" if index_key == "NIFTY" else "BANKNIFTY"
+    url = (
+        "https://www.nseindia.com/api/"
+        f"option-chain-indices?symbol={symbol}"
+    )
+
+    try:
+        response = http.get(url, timeout=10)
+
+        if response.status_code in (401, 403):
+            http.get("https://www.nseindia.com", timeout=8)
+            response = http.get(url, timeout=10)
+
+        response.raise_for_status()
+        payload = response.json().get("records", {})
+        today = now().date()
+        expiries = []
+
+        for expiry in payload.get("expiryDates", []):
+            try:
+                expiry_date = datetime.strptime(
+                    expiry, "%d-%b-%Y"
+                ).date()
+                if expiry_date >= today:
+                    expiries.append((expiry_date, expiry))
+            except ValueError:
+                continue
+
+        if not expiries:
+            return None
+
+        expiry_date, expiry_text = min(expiries)
+        rows = []
+
+        for row in payload.get("data", []):
+            if row.get("expiryDate") != expiry_text:
+                continue
+
+            try:
+                strike = float(row["strikePrice"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            rows.append({
+                "strike": strike,
+                "expiry": expiry_text,
+                "CE": parse_leg(row.get("CE")),
+                "PE": parse_leg(row.get("PE")),
+            })
+
+        return {
+            "expiry": expiry_text,
+            "expiry_date": expiry_date,
+            "rows": rows,
+        }
+
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        print(f"Option chain error {symbol}:", exc)
         return None
 
 
-# ============================================================
-# TIME / MARKET HELPERS
-# ============================================================
-
-def now_ist():
-    return datetime.now(TIMEZONE)
-
-
-def today_string():
-    return now_ist().strftime("%Y-%m-%d")
-
-
-def is_market_open():
-    now = now_ist()
-
-    if now.weekday() >= 5:
-        return False
-
-    return TRADE_START_TIME <= now.time() <= TRADE_END_TIME
-
-
-def get_atm_strike(spot, step):
-    return int(round(spot / step) * step)
-
-
-# ============================================================
-# INDICATORS
-# ============================================================
-
-def calculate_rsi(series, window=14):
-    if len(series) < window + 1:
+def parse_leg(leg):
+    if not isinstance(leg, dict):
         return None
 
-    s = pd.Series(series, dtype=float)
-    delta = s.diff()
+    try:
+        premium = float(leg.get("lastPrice", 0) or 0)
+        if premium <= 0:
+            return None
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+        return {
+            "premium": premium,
+            "volume": float(leg.get("totalTradedVolume", 0) or 0),
+            "oi": float(leg.get("openInterest", 0) or 0),
+            "change_oi": float(
+                leg.get("changeinOpenInterest", 0) or 0
+            ),
+            "iv": float(leg.get("impliedVolatility", 0) or 0),
+        }
 
-    avg_gain = gain.ewm(
-        alpha=1 / window,
-        adjust=False,
-        min_periods=window
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / window,
-        adjust=False,
-        min_periods=window
-    ).mean()
-
-    last_loss = float(avg_loss.iloc[-1])
-    last_gain = float(avg_gain.iloc[-1])
-
-    if last_loss == 0:
-        return 100.0 if last_gain != 0 else 50.0
-
-    rs = last_gain / last_loss
-    return float(100 - (100 / (1 + rs)))
-
-
-def calculate_adx(series, period=14):
-    if len(series) < period * 2 + 2:
-        return 0.0
-
-    s = pd.Series(series, dtype=float)
-
-    diff = s.diff()
-    pos_dm = diff.clip(lower=0)
-    neg_dm = (-diff).clip(lower=0)
-
-    tr = diff.abs()
-
-    atr = tr.ewm(
-        span=period,
-        adjust=False,
-        min_periods=period
-    ).mean()
-
-    pos_di = 100 * (
-        pos_dm.ewm(span=period, adjust=False).mean()
-        / (atr + 1e-9)
-    )
-
-    neg_di = 100 * (
-        neg_dm.ewm(span=period, adjust=False).mean()
-        / (atr + 1e-9)
-    )
-
-    dx = 100 * (
-        (pos_di - neg_di).abs()
-        / (pos_di + neg_di + 1e-9)
-    )
-
-    adx = dx.ewm(
-        span=period,
-        adjust=False
-    ).mean().iloc[-1]
-
-    return float(adx) if np.isfinite(adx) else 0.0
-
-
-def calculate_tick_volatility(series, lookback=20):
-    if len(series) < lookback + 1:
-        return 0.0
-
-    s = np.asarray(series[-lookback:], dtype=float)
-    diffs = np.diff(s)
-
-    if len(diffs) == 0:
-        return 0.0
-
-    return float(np.std(diffs))
-
-
-def calculate_momentum(series, lookback=8):
-    if len(series) <= lookback:
-        return 0.0
-
-    return float(series[-1] - series[-1 - lookback])
-
-
-def calculate_slope(series, lookback=10):
-    if len(series) < lookback:
-        return 0.0
-
-    y = np.asarray(series[-lookback:], dtype=float)
-    x = np.arange(len(y), dtype=float)
-
-    slope = np.polyfit(x, y, 1)[0]
-    return float(slope)
-
-
-# ============================================================
-# ADAPTIVE CONFIDENCE ENGINE
-# ============================================================
-
-def build_signal(index_name, current_spot, info):
-    history = price_history[index_name]
-
-    if len(history) < EMA_TREND + 10:
+    except (TypeError, ValueError):
         return None
 
-    s = pd.Series(history, dtype=float)
 
+def calc_rsi(values, period=RSI_PERIOD):
+    if len(values) < period + 1:
+        return None
+
+    series = pd.Series(values, dtype=float)
+    delta = series.diff()
+    gain = delta.clip(lower=0).ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
+    loss = (-delta.clip(upper=0)).ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
+
+    avg_gain = float(gain.iloc[-1])
+    avg_loss = float(loss.iloc[-1])
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+
+    rs = avg_gain / avg_loss
+    return float(100 - 100 / (1 + rs))
+
+
+def calc_strength(values, period=14):
+    if len(values) < period * 2:
+        return 0.0
+
+    changes = np.diff(np.asarray(values[-period * 2:], dtype=float))
+    denominator = float(np.sum(np.abs(changes)))
+
+    if denominator <= 1e-9:
+        return 0.0
+
+    return min(
+        100.0,
+        100.0 * abs(float(np.sum(changes))) / denominator,
+    )
+
+
+def build_sentiment(index_key, spot):
+    history = price_history[index_key]
+    history.append(float(spot))
+
+    if len(history) > 500:
+        del history[:-500]
+
+    if len(history) < EMA_TREND:
+        return None
+
+    series = pd.Series(history, dtype=float)
     ema_trend = float(
-        s.ewm(span=EMA_TREND, adjust=False).mean().iloc[-1]
+        series.ewm(span=EMA_TREND, adjust=False).mean().iloc[-1]
     )
     ema_fast = float(
-        s.ewm(span=EMA_FAST, adjust=False).mean().iloc[-1]
+        series.ewm(span=EMA_FAST, adjust=False).mean().iloc[-1]
     )
     ema_slow = float(
-        s.ewm(span=EMA_SLOW, adjust=False).mean().iloc[-1]
+        series.ewm(span=EMA_SLOW, adjust=False).mean().iloc[-1]
     )
 
-    rsi = calculate_rsi(history, RSI_PERIOD)
-    adx = calculate_adx(history, ADX_PERIOD)
+    rsi = calc_rsi(history)
+    strength = calc_strength(history)
 
     if rsi is None:
         return None
 
-    momentum = calculate_momentum(history, 8)
-    slope = calculate_slope(history, 10)
-    volatility = calculate_tick_volatility(history, 20)
+    momentum = history[-1] - history[-min(9, len(history))]
+    bull = 0.0
+    bear = 0.0
 
-    recent = history[-8:]
-    recent_high = max(recent)
-    recent_low = min(recent)
+    if spot > ema_trend:
+        bull += 25
+    elif spot < ema_trend:
+        bear += 25
 
-    # --------------------------------------------------------
-    # Direction scoring
-    # --------------------------------------------------------
-
-    bull_score = 0.0
-    bear_score = 0.0
-
-    # 1. Macro trend: 20 points
-    if current_spot > ema_trend:
-        bull_score += 20
-    elif current_spot < ema_trend:
-        bear_score += 20
-
-    # 2. Fast/slow EMA alignment: 15 points
     if ema_fast > ema_slow:
-        bull_score += 15
+        bull += 20
     elif ema_fast < ema_slow:
-        bear_score += 15
+        bear += 20
 
-    # 3. RSI confirmation: 15 points
-    if 55 <= rsi <= 70:
-        bull_score += 15
-    elif 30 <= rsi <= 45:
-        bear_score += 15
+    if 52 <= rsi <= 68:
+        bull += 20
+    elif 32 <= rsi <= 48:
+        bear += 20
 
-    # 4. ADX trend strength: 15 points
-    if adx >= MIN_ADX_TREND:
-        if bull_score >= bear_score:
-            bull_score += 15
-        else:
-            bear_score += 15
-
-    # 5. Momentum: 10 points
     if momentum > 0:
-        bull_score += 10
+        bull += 15
     elif momentum < 0:
-        bear_score += 10
+        bear += 15
 
-    # 6. Short-term slope: 10 points
-    if slope > 0:
-        bull_score += 10
-    elif slope < 0:
-        bear_score += 10
-
-    # 7. Price position in recent range: 10 points
-    range_size = recent_high - recent_low
-
-    if range_size > 0:
-        position = (current_spot - recent_low) / range_size
-
-        if position >= 0.70:
-            bull_score += 10
-        elif position <= 0.30:
-            bear_score += 10
-
-    # --------------------------------------------------------
-    # Regime / quality adjustments
-    # --------------------------------------------------------
-
-    # Very low movement = avoid dead/flat market.
-    if volatility > 0:
-        if abs(momentum) < volatility * 0.8:
-            bull_score -= 5
-            bear_score -= 5
-
-    bull_score = max(0.0, min(100.0, bull_score))
-    bear_score = max(0.0, min(100.0, bear_score))
-
-    if bull_score >= bear_score:
-        direction = "BULLISH"
-        confidence = bull_score
+    if strength >= MIN_TREND_STRENGTH:
+        if bull >= bear:
+            bull += 20
+        else:
+            bear += 20
     else:
-        direction = "BEARISH"
-        confidence = bear_score
+        bull -= 10
+        bear -= 10
 
-    # Need strong trend + strong confidence.
-    if adx < MIN_ADX_TREND:
+    bull = max(0, min(100, bull))
+    bear = max(0, min(100, bear))
+
+    direction = "CE" if bull > bear else "PE" if bear > bull else None
+    confidence = max(bull, bear)
+
+    if not direction or confidence < MIN_CONFIDENCE:
         return None
 
-    if confidence < MIN_CONFIDENCE:
+    if strength < MIN_TREND_STRENGTH:
         return None
 
-    # RSI extremes are avoided because chasing can be risky.
-    if direction == "BULLISH" and not (55 <= rsi <= 70):
-        return None
-
-    if direction == "BEARISH" and not (30 <= rsi <= 45):
-        return None
-
-    # Require directional EMA alignment.
-    if direction == "BULLISH" and not (
-        current_spot > ema_trend and ema_fast > ema_slow
+    if direction == "CE" and not (
+        spot > ema_trend
+        and ema_fast > ema_slow
+        and 52 <= rsi <= 68
     ):
         return None
 
-    if direction == "BEARISH" and not (
-        current_spot < ema_trend and ema_fast < ema_slow
+    if direction == "PE" and not (
+        spot < ema_trend
+        and ema_fast < ema_slow
+        and 32 <= rsi <= 48
     ):
         return None
-
-    atm_strike = get_atm_strike(current_spot, info["step"])
-
-    if direction == "BULLISH":
-        option_name = f"{index_name} {atm_strike} CE"
-        sentiment = "STRONG BULLISH REGIME"
-        confirm_level = round(recent_high + 2.5, 2)
-    else:
-        option_name = f"{index_name} {atm_strike} PE"
-        sentiment = "STRONG BEARISH REGIME"
-        confirm_level = round(recent_low - 2.5, 2)
 
     return {
         "direction": direction,
         "confidence": confidence,
-        "sentiment": sentiment,
-        "option_name": option_name,
-        "confirm_level": confirm_level,
-        "target_pts": info["target_pts"],
-        "sl_pts": info["initial_sl_pts"],
-        "trail_trigger_pts": info["trail_trigger_pts"],
-        "lot_size": info["lot_size"],
-        "adx": adx,
         "rsi": rsi,
+        "strength": strength,
         "momentum": momentum,
-        "slope": slope,
-        "volatility": volatility,
     }
 
 
-# ============================================================
-# DAILY RESET
-# ============================================================
+def nearest_atm_row(chain, spot, step):
+    rows = chain.get("rows", [])
+    if not rows:
+        return None
 
-def reset_daily_counter_if_needed():
-    global trades_count
-    global trade_date
-    global last_signal_time
-    global price_history
-    global total_pnl
-    global active_positions
-    global pending_confirmations
-
-    today = today_string()
-    message = None
-
-    with state_lock:
-        # IMPORTANT: this block runs ONLY when the calendar date changes.
-        if trade_date != today:
-            trade_date = today
-            trades_count = 0
-            total_pnl = 0.0
-            last_signal_time = {}
-            active_positions = {}
-            pending_confirmations = {}
-            price_history = {
-                "NIFTY": [],
-                "BANKNIFTY": []
-            }
-
-            message = (
-                f"🌅 NEW TRADING DAY\n"
-                f"Date: {today}\n"
-                f"Engine: Multi-Layer Adaptive High Confidence\n"
-                f"Limit: {MAX_DAILY_TRADES} quality trades\n"
-                f"Mode: Single Direction Only"
-            )
-
-    # Send exactly once per new date. Never send on every loop.
-    if message:
-        send_alert(message)
+    atm = round(spot / step) * step
+    return min(rows, key=lambda row: abs(row["strike"] - atm))
 
 
-# ============================================================
-# TRADE LOG
-# ============================================================
+def log_trade(position, exit_premium, reason, pnl):
+    exists = os.path.exists(CSV_FILE)
 
-def log_trade(index_name, pos, exit_spot, pnl, result):
+    row = {
+        "date": now().strftime("%Y-%m-%d"),
+        "time": now().strftime("%H:%M:%S"),
+        "index": position["index"],
+        "option": position["option_name"],
+        "expiry": position["expiry"],
+        "strike": position["strike"],
+        "lots": position["lots"],
+        "lot_size": position["lot_size"],
+        "entry_premium": round(position["entry_premium"], 2),
+        "exit_premium": round(exit_premium, 2),
+        "reason": reason,
+        "pnl_rupees": round(pnl, 2),
+        "confidence": round(position["confidence"], 1),
+    }
+
     try:
-        exists = os.path.exists(CSV_FILE)
-
-        row = {
-            "date": today_string(),
-            "time": now_ist().strftime("%H:%M:%S"),
-            "asset": index_name,
-            "option": pos.get("option_name", ""),
-            "direction": pos.get("direction", ""),
-            "entry_spot": pos.get("entry_spot", ""),
-            "exit_spot": exit_spot,
-            "confidence": pos.get("confidence", ""),
-            "result": result,
-            "pnl": round(pnl, 2),
-        }
-
-        df = pd.DataFrame([row])
-        df.to_csv(
-            CSV_FILE,
-            mode="a",
-            header=not exists,
-            index=False
-        )
-    except Exception as e:
-        print(f"Trade log error: {e}")
+        with open(CSV_FILE, "a", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=row.keys())
+            if not exists:
+                writer.writeheader()
+            writer.writerow(row)
+    except OSError as exc:
+        print("Trade log error:", exc)
 
 
-# ============================================================
-# POSITION TRACKER
-# ============================================================
+def close_position(index_key, premium, reason):
+    global realized_pnl
 
-def track_open_positions(rates):
-    global total_pnl
-
-    notifications = []
-
-    with state_lock:
-        closed = []
-
-        for index_name, pos in list(active_positions.items()):
-            current_spot = rates.get(index_name)
-
-            if not current_spot:
-                continue
-
-            hit_target = False
-            hit_sl = False
-
-            if pos["direction"] == "BULLISH":
-                gain_pts = current_spot - pos["entry_spot"]
-
-                if gain_pts >= pos["trail_trigger_pts"]:
-                    new_sl = round(
-                        pos["entry_spot"]
-                        + (gain_pts - pos["trail_trigger_pts"]) * 0.6,
-                        2
-                    )
-
-                    if new_sl > pos["sl_price"]:
-                        pos["sl_price"] = new_sl
-                        pos["is_trailed"] = True
-
-                        notifications.append(
-                            f"🛡️ TRAILING SL SHIFTED\n"
-                            f"{index_name} CE\n"
-                            f"New Spot Lock: ₹{new_sl:,.2f}"
-                        )
-
-                if current_spot >= pos["target_price"]:
-                    hit_target = True
-                elif current_spot <= pos["sl_price"]:
-                    hit_sl = True
-
-            else:
-                gain_pts = pos["entry_spot"] - current_spot
-
-                if gain_pts >= pos["trail_trigger_pts"]:
-                    new_sl = round(
-                        pos["entry_spot"]
-                        - (gain_pts - pos["trail_trigger_pts"]) * 0.6,
-                        2
-                    )
-
-                    if new_sl < pos["sl_price"]:
-                        pos["sl_price"] = new_sl
-                        pos["is_trailed"] = True
-
-                        notifications.append(
-                            f"🛡️ TRAILING SL SHIFTED\n"
-                            f"{index_name} PE\n"
-                            f"New Spot Lock: ₹{new_sl:,.2f}"
-                        )
-
-                if current_spot <= pos["target_price"]:
-                    hit_target = True
-                elif current_spot >= pos["sl_price"]:
-                    hit_sl = True
-
-            if hit_target:
-                pnl = pos["target_pts"] * pos["lot_size"]
-                total_pnl += pnl
-
-                log_trade(
-                    index_name,
-                    pos,
-                    current_spot,
-                    pnl,
-                    "TARGET"
-                )
-
-                notifications.append(
-                    f"🎯 TARGET ACHIEVED\n"
-                    f"Asset: {index_name}\n"
-                    f"Option: {pos['option_name']}\n"
-                    f"Entry Spot: ₹{pos['entry_spot']:,.2f}\n"
-                    f"Exit Spot: ₹{current_spot:,.2f}\n"
-                    f"Gain: +{pos['target_pts']} pts\n"
-                    f"Model P&L: +₹{pnl:,.2f}\n"
-                    f"Total P&L: ₹{total_pnl:,.2f}"
-                )
-
-                closed.append(index_name)
-
-            elif hit_sl:
-                exit_diff = (
-                    current_spot - pos["entry_spot"]
-                    if pos["direction"] == "BULLISH"
-                    else pos["entry_spot"] - current_spot
-                )
-
-                pnl = exit_diff * pos["lot_size"]
-                total_pnl += pnl
-
-                result = "TRAIL_EXIT" if (
-                    pos.get("is_trailed") and pnl >= 0
-                ) else "STOPLOSS"
-
-                log_trade(
-                    index_name,
-                    pos,
-                    current_spot,
-                    pnl,
-                    result
-                )
-
-                notifications.append(
-                    f"{'🛡️ PROFIT PROTECTED EXIT' if result == 'TRAIL_EXIT' else '🛑 STOPLOSS EXIT'}\n"
-                    f"Asset: {index_name}\n"
-                    f"Option: {pos['option_name']}\n"
-                    f"Entry Spot: ₹{pos['entry_spot']:,.2f}\n"
-                    f"Exit Spot: ₹{current_spot:,.2f}\n"
-                    f"Points: {exit_diff:+.2f}\n"
-                    f"Model P&L: {'+' if pnl >= 0 else '-'}₹{abs(pnl):,.2f}\n"
-                    f"Total P&L: {'+' if total_pnl >= 0 else '-'}₹{abs(total_pnl):,.2f}"
-                )
-
-                closed.append(index_name)
-
-        for index_name in closed:
-            active_positions.pop(index_name, None)
-
-    for message in notifications:
-        send_alert(message)
-
-
-# ============================================================
-# BREAKOUT CONFIRMATION
-# ============================================================
-
-def process_pending_confirmations(rates):
-    global trades_count
-
-    notifications = []
-
-    with state_lock:
-        confirmed = []
-
-        for index_name, setup in list(pending_confirmations.items()):
-            spot = rates.get(index_name)
-
-            if not spot:
-                continue
-
-            created = setup.get("created_at")
-            if created:
-                age = (
-                    now_ist() - created
-                ).total_seconds() / 60
-
-                if age > SETUP_EXPIRY_MINUTES:
-                    notifications.append(
-                        f"⌛ SETUP EXPIRED\n"
-                        f"Asset: {index_name}\n"
-                        f"Confidence: {setup['confidence']:.1f}%"
-                    )
-                    confirmed.append(index_name)
-                    continue
-
-            if trades_count >= MAX_DAILY_TRADES:
-                continue
-
-            direction = setup["direction"]
-
-            is_confirmed = (
-                direction == "BULLISH"
-                and spot >= setup["confirm_level"]
-            ) or (
-                direction == "BEARISH"
-                and spot <= setup["confirm_level"]
-            )
-
-            if not is_confirmed:
-                continue
-
-            trades_count += 1
-
-            last_signal_time[index_name] = now_ist()
-
-            target_pts = setup["target_pts"]
-            sl_pts = setup["sl_pts"]
-
-            if direction == "BULLISH":
-                target_price = round(spot + target_pts, 2)
-                sl_price = round(spot - sl_pts, 2)
-            else:
-                target_price = round(spot - target_pts, 2)
-                sl_price = round(spot + sl_pts, 2)
-
-            active_positions[index_name] = {
-                "asset": index_name,
-                "option_name": setup["option_name"],
-                "direction": direction,
-                "entry_spot": spot,
-                "target_price": target_price,
-                "sl_price": sl_price,
-                "target_pts": target_pts,
-                "sl_pts": sl_pts,
-                "trail_trigger_pts": setup["trail_trigger_pts"],
-                "lot_size": setup["lot_size"],
-                "confidence": setup["confidence"],
-                "date": today_string(),
-                "entry_time": now_ist().strftime("%H:%M:%S"),
-                "is_trailed": False,
-            }
-
-            notifications.append(
-                f"⚡ HIGH-CONFIDENCE CONFIRMED\n"
-                f"Asset: {index_name}\n"
-                f"Action: BUY {setup['option_name']} ONLY\n"
-                f"Direction: {direction}\n"
-                f"Confidence: {setup['confidence']:.1f}%\n"
-                f"Entry Spot: ₹{spot:,.2f}\n"
-                f"ADX: {setup['adx']:.1f}\n"
-                f"RSI: {setup['rsi']:.1f}\n"
-                f"🎯 Target Spot: ₹{target_price:,.2f}\n"
-                f"🛑 Stop Spot: ₹{sl_price:,.2f}\n"
-                f"Trade #{trades_count}/{MAX_DAILY_TRADES}\n"
-                f"⚠️ Alert/model only — no broker order placed."
-            )
-
-            confirmed.append(index_name)
-
-        for index_name in confirmed:
-            pending_confirmations.pop(index_name, None)
-
-    for message in notifications:
-        send_alert(message)
-
-
-# ============================================================
-# INDEX ANALYSIS
-# ============================================================
-
-def analyze_index(index_name, current_spot, info):
-    history = price_history[index_name]
-
-    history.append(float(current_spot))
-
-    if len(history) > 180:
-        history.pop(0)
-
-    if len(history) < EMA_TREND + 10:
-        return
-
-    with state_lock:
-        if (
-            index_name in active_positions
-            or index_name in pending_confirmations
-            or trades_count >= MAX_DAILY_TRADES
-        ):
+    with lock:
+        position = open_positions.pop(index_key, None)
+        if not position:
             return
 
-    previous = last_signal_time.get(index_name)
+        pnl = (
+            float(premium) - position["entry_premium"]
+        ) * position["lot_size"] * position["lots"]
+        realized_pnl += pnl
+        daily_pnl = realized_pnl
 
-    if previous:
-        cooldown = (
-            now_ist() - previous
-        ).total_seconds() / 60
-
-        if cooldown < SIGNAL_COOLDOWN_MINUTES:
-            return
-
-    setup = build_signal(
-        index_name,
-        current_spot,
-        info
-    )
-
-    if not setup:
-        return
-
-    # One-direction rule: never create both CE and PE for
-    # the same index at the same time.
-    with state_lock:
-        if index_name in active_positions:
-            return
-
-        if index_name in pending_confirmations:
-            return
-
-        pending_confirmations[index_name] = {
-            **setup,
-            "created_at": now_ist()
-        }
+    log_trade(position, premium, reason, pnl)
 
     send_alert(
-        f"🔍 HIGH-CONFIDENCE SETUP DETECTED\n"
-        f"Asset: {index_name}\n"
-        f"Candidate: BUY {setup['option_name']} ONLY\n"
-        f"Direction: {setup['direction']}\n"
-        f"Confidence: {setup['confidence']:.1f}%\n"
-        f"Sentiment: {setup['sentiment']}\n"
-        f"ADX: {setup['adx']:.1f}\n"
-        f"RSI: {setup['rsi']:.1f}\n"
-        f"Momentum: {setup['momentum']:+.2f}\n"
-        f"Trigger Level: ₹{setup['confirm_level']:,.2f}\n"
-        f"⏳ Waiting for breakout confirmation..."
+        f"📘 PAPER EXIT: {reason}\n"
+        f"Option: {position['option_name']}\n"
+        f"Entry premium: ₹{position['entry_premium']:.2f}\n"
+        f"Exit premium: ₹{premium:.2f}\n"
+        f"Lots: {position['lots']}\n"
+        f"Estimated trade P&L: ₹{pnl:,.2f}\n"
+        f"Today's realized P&L: ₹{daily_pnl:,.2f}\n"
+        f"No real order was placed.",
+        dedupe_key=f"exit:{position['trade_id']}",
     )
 
 
-# ============================================================
-# TELEGRAM COMMANDS
-# ============================================================
+def track_positions(chains):
+    for index_key, position in list(open_positions.items()):
+        chain = chains.get(index_key)
+        if not chain:
+            continue
 
-def check_telegram_commands():
-    global bot_active
-    global last_update_id
-
-    if not telegram_ready():
-        return
-
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-
-        res = requests.get(
-            url,
-            params={
-                "offset": last_update_id + 1,
-                "timeout": 1
-            },
-            timeout=5
+        row = next(
+            (
+                item for item in chain["rows"]
+                if item["strike"] == position["strike"]
+                and item["expiry"] == position["expiry"]
+            ),
+            None,
         )
 
-        if res.status_code != 200:
-            return
+        leg = row.get(position["direction"]) if row else None
+        if not leg:
+            continue
 
-        for update in res.json().get("result", []):
-            last_update_id = update.get(
-                "update_id",
-                last_update_id
-            )
+        premium = leg["premium"]
 
-            msg = update.get("message", {})
-            text = msg.get("text", "").strip().lower()
-            sender = str(
-                msg.get("chat", {}).get("id", "")
-            )
-
-            if sender != CHAT_ID:
+        with lock:
+            current = open_positions.get(index_key)
+            if not current:
                 continue
 
-            if text == "/start":
-                send_alert(
-                    "🤖 Engine Online\n"
-                    "/status - current status\n"
-                    "/pnl - today's model P&L\n"
-                    "/pause - pause new setups\n"
-                    "/resume - resume new setups"
-                )
+            current["peak_premium"] = max(
+                current["peak_premium"], premium
+            )
+            peak = current["peak_premium"]
+            entry = current["entry_premium"]
 
-            elif text == "/pnl":
-                send_alert(
-                    f"💰 P&L SUMMARY\n"
-                    f"Trades: {trades_count}/{MAX_DAILY_TRADES}\n"
-                    f"Realized model P&L: "
-                    f"{'+' if total_pnl >= 0 else '-'}"
-                    f"₹{abs(total_pnl):,.2f}"
-                )
-
-            elif text == "/status":
-                with state_lock:
-                    open_items = [
-                        f"• {k}: {v['option_name']} "
-                        f"(SL ₹{v['sl_price']:,.2f})"
-                        for k, v in active_positions.items()
-                    ]
-
-                    pending_items = [
-                        f"• {k}: {v['option_name']} "
-                        f"({v['confidence']:.1f}%)"
-                        for k, v in pending_confirmations.items()
-                    ]
-
-                open_str = "\n".join(open_items) or "None"
-                pending_str = "\n".join(pending_items) or "None"
-
-                send_alert(
-                    f"📊 BOT STATUS\n"
-                    f"State: {'ACTIVE' if bot_active else 'PAUSED'}\n"
-                    f"Trades: {trades_count}/{MAX_DAILY_TRADES}\n"
-                    f"Open Positions:\n{open_str}\n"
-                    f"Pending Setups:\n{pending_str}\n"
-                    f"Model P&L: "
-                    f"{'+' if total_pnl >= 0 else '-'}"
-                    f"₹{abs(total_pnl):,.2f}"
-                )
-
-            elif text == "/pause":
-                bot_active = False
-                send_alert("⏸️ NEW SIGNALS PAUSED.")
-
-            elif text == "/resume":
-                bot_active = True
-                send_alert("▶️ NEW SIGNALS RESUMED.")
-
-    except Exception as e:
-        print(f"Telegram command error: {e}")
+        if premium >= entry * (1 + TARGET_PCT):
+            close_position(index_key, premium, "TARGET")
+        elif premium <= entry * (1 - STOPLOSS_PCT):
+            close_position(index_key, premium, "STOPLOSS")
+        elif (
+            peak >= entry * (1 + TRAIL_START_PCT)
+            and premium <= peak * (1 - TRAIL_GIVEBACK_PCT)
+        ):
+            close_position(index_key, premium, "TRAILING_STOP")
 
 
-def telegram_loop():
+def can_open_new_trade():
+    return (
+        trades_today < MAX_DAILY_TRADES
+        and realized_pnl > -MAX_DAILY_LOSS_RUPEES
+    )
+
+
+def try_open_position(index_key, spot, sentiment, chain):
+    global trades_today
+
+    config = WATCHLIST[index_key]
+    row = nearest_atm_row(chain, spot, config["strike_step"])
+
+    if not row:
+        return
+
+    direction = sentiment["direction"]
+    leg = row.get(direction)
+
+    if not leg or leg["premium"] < MIN_OPTION_PREMIUM:
+        return
+
+    if leg["volume"] <= 0:
+        return
+
+    now_ts = time.time()
+    if now_ts - last_signal_at.get(index_key, 0) < 600:
+        return
+
+    trade_id = (
+        f"{now().strftime('%Y%m%d%H%M%S')}-"
+        f"{index_key}-{direction}-{int(row['strike'])}"
+    )
+
+    position = {
+        "trade_id": trade_id,
+        "index": index_key,
+        "option_name": f"{index_key} {int(row['strike'])} {direction}",
+        "direction": direction,
+        "strike": row["strike"],
+        "expiry": row["expiry"],
+        "entry_premium": leg["premium"],
+        "peak_premium": leg["premium"],
+        "lots": LOTS_PER_TRADE,
+        "lot_size": config["lot_size"],
+        "confidence": sentiment["confidence"],
+        "entry_time": now().isoformat(timespec="seconds"),
+    }
+
+    with lock:
+        if index_key in open_positions or not can_open_new_trade():
+            return
+
+        open_positions[index_key] = position
+        trades_today += 1
+        last_signal_at[index_key] = now_ts
+        count = trades_today
+
+    send_alert(
+        f"🟢 PAPER ENTRY — OPTION BUYING\n"
+        f"No real order placed\n"
+        f"BUY {position['option_name']}\n"
+        f"Expiry: {position['expiry']}\n"
+        f"Sentiment: {direction}\n"
+        f"Confidence score: {sentiment['confidence']:.0f}/100\n"
+        f"RSI: {sentiment['rsi']:.1f}\n"
+        f"Entry premium: ₹{position['entry_premium']:.2f}\n"
+        f"Quantity: {LOTS_PER_TRADE} lots × "
+        f"{config['lot_size']} units\n"
+        f"Target premium: ₹"
+        f"{position['entry_premium'] * (1 + TARGET_PCT):.2f}\n"
+        f"Stop premium: ₹"
+        f"{position['entry_premium'] * (1 - STOPLOSS_PCT):.2f}\n"
+        f"Trade {count}/{MAX_DAILY_TRADES}\n"
+        f"Daily loss limit: ₹{MAX_DAILY_LOSS_RUPEES:,.0f}",
+        dedupe_key=f"entry:{trade_id}",
+    )
+
+
+def reset_daily_state_if_needed():
+    global trade_date, trades_today, realized_pnl
+    global price_history, last_signal_at, last_alert_keys
+
+    today = now().strftime("%Y-%m-%d")
+
+    with lock:
+        if trade_date == today:
+            return
+
+        leftovers = list(open_positions.items())
+        open_positions.clear()
+        trade_date = today
+        trades_today = 0
+        realized_pnl = 0.0
+        price_history = {key: [] for key in WATCHLIST}
+        last_signal_at = {}
+        last_alert_keys = set()
+
+    if leftovers:
+        send_alert(
+            "⚠️ New date reset: leftover paper positions were cleared. "
+            "Review the previous session log."
+        )
+
+    send_alert(
+        f"🌅 NEW TRADING DAY\nDate: {today}\n"
+        f"Strategy: CE/PE option buying\n"
+        f"Mode: Paper trading only\n"
+        f"Maximum trades: {MAX_DAILY_TRADES}\n"
+        f"Lots per trade: {LOTS_PER_TRADE}\n"
+        f"Premium target: +{TARGET_PCT * 100:.1f}%\n"
+        f"Premium stop-loss: -{STOPLOSS_PCT * 100:.1f}%\n"
+        f"Daily loss limit: ₹{MAX_DAILY_LOSS_RUPEES:,.0f}",
+        dedupe_key=f"newday:{today}",
+    )
+
+
+def telegram_commands_loop():
+    global last_update_id, bot_active
+
     while True:
+        if not telegram_ready():
+            time.sleep(5)
+            continue
+
         try:
-            check_telegram_commands()
-        except Exception as e:
-            print(f"Telegram loop error: {e}")
+            response = requests.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+                params={"offset": last_update_id + 1, "timeout": 1},
+                timeout=5,
+            )
+
+            if response.status_code == 200:
+                for update in response.json().get("result", []):
+                    last_update_id = max(
+                        last_update_id,
+                        update.get("update_id", last_update_id),
+                    )
+
+                    message = update.get("message", {})
+                    sender = str(message.get("chat", {}).get("id", ""))
+                    command = message.get("text", "").strip().lower()
+
+                    if sender != CHAT_ID:
+                        continue
+
+                    if command == "/status":
+                        with lock:
+                            lines = [
+                                f"{key}: {value['option_name']} "
+                                f"entry ₹{value['entry_premium']:.2f}"
+                                for key, value in open_positions.items()
+                            ]
+                            status = (
+                                f"📊 PAPER BOT STATUS\n"
+                                f"Active: {bot_active}\n"
+                                f"Trades: {trades_today}/{MAX_DAILY_TRADES}\n"
+                                f"Realized P&L: ₹{realized_pnl:,.2f}\n"
+                                f"Open positions:\n"
+                                + ("\n".join(lines) or "None")
+                            )
+                        send_alert(status)
+
+                    elif command == "/pnl":
+                        send_alert(
+                            f"💰 PAPER P&L\n"
+                            f"Trades: {trades_today}/{MAX_DAILY_TRADES}\n"
+                            f"Realized P&L: ₹{realized_pnl:,.2f}\n"
+                            f"Daily loss limit: ₹{MAX_DAILY_LOSS_RUPEES:,.0f}"
+                        )
+
+                    elif command == "/pause":
+                        bot_active = False
+                        send_alert("⏸️ New paper entries paused.")
+
+                    elif command == "/resume":
+                        bot_active = True
+                        send_alert("▶️ New paper entries resumed.")
+
+                    elif command == "/start":
+                        send_alert(
+                            "Commands: /status /pnl /pause /resume\n"
+                            "Paper trading only; no broker orders."
+                        )
+
+        except (requests.RequestException, ValueError) as exc:
+            print("Telegram command error:", exc)
 
         time.sleep(2)
 
 
-# ============================================================
-# MAIN TRADING LOOP
-# ============================================================
+def market_open():
+    current = now()
+    return (
+        current.weekday() < 5
+        and TRADE_START <= current.time() <= TRADE_END
+    )
 
-def main_trading_loop():
-    global trade_date
 
-    trade_date = today_string()
-
-    if not telegram_ready():
-        print(
-            "WARNING: BOT_TOKEN/CHAT_ID are not configured. "
-            "Set them in Render Environment Variables."
-        )
+def main_loop():
+    reset_daily_state_if_needed()
 
     send_alert(
-        "🚀 MULTI-LAYER ADAPTIVE HIGH-CONFIDENCE ENGINE ONLINE\n"
-        "• 50 EMA macro trend\n"
-        "• 9/21 EMA alignment\n"
-        "• RSI confirmation\n"
-        "• ADX trend-strength filter\n"
-        "• Momentum + slope confirmation\n"
-        "• Recent-range breakout confirmation\n"
-        "• Adaptive confidence threshold\n"
-        "• Single-direction CE OR PE only\n"
-        f"• Minimum confidence: {MIN_CONFIDENCE:.0f}%\n"
-        f"• Daily limit: {MAX_DAILY_TRADES}\n"
-        "⚠️ Alerts/model only — no broker orders."
+        "🚀 CE/PE Paper Bot online\n"
+        "Sentiment filter + option premium target/SL\n"
+        "Paper trading only — no real orders.",
+        dedupe_key=f"startup:{now().strftime('%Y-%m-%d')}",
     )
 
     while True:
         try:
-            reset_daily_counter_if_needed()
+            reset_daily_state_if_needed()
 
-            if not bot_active or not is_market_open():
+            current = now()
+
+            if (
+                current.weekday() >= 5
+                or current.time() < TRADE_START
+                or current.time() > FORCE_EXIT_TIME
+            ):
                 time.sleep(20)
                 continue
 
-            rates = get_nse_live_prices()
+            spots = fetch_index_spots()
+            if not spots:
+                time.sleep(SCAN_INTERVAL_SECONDS)
+                continue
 
-            if rates:
-                track_open_positions(rates)
-                process_pending_confirmations(rates)
+            chains = {}
+            for key in WATCHLIST:
+                chains[key] = fetch_option_chain(key)
+                time.sleep(1)
 
-                with state_lock:
-                    can_scan = trades_count < MAX_DAILY_TRADES
+            track_positions(chains)
 
-                if can_scan:
-                    for name, info in WATCHLIST.items():
-                        spot = rates.get(name)
+            if current.time() >= FORCE_EXIT_TIME:
+                for key, position in list(open_positions.items()):
+                    chain = chains.get(key)
+                    if not chain:
+                        continue
 
-                        if spot is not None:
-                            analyze_index(
-                                name,
-                                spot,
-                                info
-                            )
+                    row = next(
+                        (
+                            item for item in chain["rows"]
+                            if item["strike"] == position["strike"]
+                            and item["expiry"] == position["expiry"]
+                        ),
+                        None,
+                    )
+                    leg = row.get(position["direction"]) if row else None
+
+                    if leg and leg["premium"] > 0:
+                        close_position(key, leg["premium"], "TIME_EXIT")
+
+                time.sleep(SCAN_INTERVAL_SECONDS)
+                continue
+
+            if not market_open() or not bot_active:
+                time.sleep(SCAN_INTERVAL_SECONDS)
+                continue
+
+            with lock:
+                if not can_open_new_trade():
+                    time.sleep(SCAN_INTERVAL_SECONDS)
+                    continue
+
+            for key, spot in spots.items():
+                with lock:
+                    if key in open_positions or not can_open_new_trade():
+                        continue
+
+                sentiment = build_sentiment(key, spot)
+                chain = chains.get(key)
+
+                if sentiment and chain:
+                    try_open_position(key, spot, sentiment, chain)
 
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-        except Exception as e:
-            print(f"Main loop error: {e}")
+        except Exception as exc:
+            print("Main loop error:", exc)
             time.sleep(10)
 
 
-# ============================================================
-# START
-# ============================================================
-
 if __name__ == "__main__":
     threading.Thread(
-        target=telegram_loop,
-        daemon=True
+        target=telegram_commands_loop,
+        daemon=True,
     ).start()
 
     threading.Thread(
-        target=main_trading_loop,
-        daemon=True
+        target=main_loop,
+        daemon=True,
     ).start()
 
-    run_web()
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        debug=False,
+        use_reloader=False,
+        threaded=True,
+    )
